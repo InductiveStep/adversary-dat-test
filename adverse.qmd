@@ -20,8 +20,11 @@ library(mgcv)
 library(quantreg)
 ```
 
+Poking around the solution for *Using optimisation methods to generate adversarial datasets for propensity score methods with large post-adjustment bias*, available [yonder](https://osf.io/d279k/).
 
-Poking around the solution for *Using optimisation methods to generate adversarial datasets for propensity score methods with large post-adjustment bias*, available [yonder](https://osf.io/d279k/). First, get the data. The following code is hiked out of the Rmd provided by the authors.
+### Setup
+
+First, get the data. The following code is hiked out of the Rmd provided by the authors.
 
 ```{r}
 N <- 2 * 100
@@ -90,21 +93,28 @@ dat <- with(solution,
             set_Y(data, intercept, coeffs, residuals))
 ```
 
+### Explore
+
 Take a peek:
 
 ```{r}
 dat
 ```
 
+```{r}
+ggpairs(dat |> mutate(X = as.factor(X)), columns = c("C1", "C2", "X"),
+        aes(alpha = .5))
+```
 
 Let's see how the covariates relate to the outcome, conditional on *X*:
 
 ```{r}
-ggpairs(dat, columns = c("C1", "C2", "Y"), aes(colour = factor(X), alpha = .5))
+ggpairs(dat, columns = c("C1", "C2", "Y"),
+        aes(colour = factor(X),
+            alpha = .5))
 ```
 
-
-The relationship between *C2* and *Y* depends on *X*: positve correlation for *X*=1 and negative for *X*=0. There's something odd going on with the relationship between *C1* and *C2*: the sign flips depending on *X*, also looks heteroskedastic.
+The relationship between *C2* and *Y* depends on *X*: positive correlation for *X*=1 and negative for *X*=0. There's something odd going on with the relationship between *C1* and *C2*: the sign flips depending on *X*, also looks heteroskedastic.
 
 Try to deal with interaction:
 
@@ -118,17 +128,15 @@ summary(mod)
 
 So we probably can't ignore it...
 
-
 ```{r}
 residualPlots(mod)
 ```
 
+There's a quadratic (maybe) relationship between *C2* and residuals.
 
-There's a quadratic (maybe) relationship between C2 and residuals.
-
+## Coarsened exact matching
 
 Let's try CEM, ignoring this, and without covariate adjustment in the outcome model.
-
 
 ```{r}
 match_cem <- matchit(X  ~ C1 + C2,
@@ -152,7 +160,6 @@ love.plot(match_cem,
           thresholds = c(m = .1))
 ```
 
-
 Matching improved balance.
 
 Density plots:
@@ -163,13 +170,11 @@ bal.plot(X ~ C1, data = dat,
          var.name = "C1", which = "both")
 ```
 
-
 ```{r}
 bal.plot(X ~ C2, data = dat, 
          weights = list(CEM = match_cem),
          var.name = "C2", which = "both")
 ```
-
 
 Also looks improved.
 
@@ -187,6 +192,8 @@ avg_comparisons(outmod,
 
 We're told the true answer is 1 but this estimate is greater than that... what's going on...? Must be clues back in the original pairs plot.
 
+## Linear regression
+
 Wondering what the ATE looks like from the regression model where the covariates are at their means:
 
 ```{r}
@@ -203,10 +210,30 @@ lm(Y ~ X, data = dat) |>
   confint()
 ```
 
+At least the CI includes 1.
+
+Now the covariates:
+
 ```{r}
-lm(Y ~ X + C1 + C2, data = dat) |>
-  confint()
+simp_ols <- lm(Y ~ X + C1 + C2, data = dat)
+confint(simp_ols)
 ```
+
+```{r}
+ncvTest(simp_ols, ~C1)
+ncvTest(simp_ols, ~C2)
+ncvTest(simp_ols, ~C1 + C2)
+ncvTest(simp_ols)
+```
+
+```{r}
+set.seed(25082023)
+Boot(simp_ols, R = 10000) |> confint()
+```
+
+Bootstrap CI includes 1 again... hmmmm!
+
+## Quantile regression
 
 How about fitting a quantile regression model instead, at the median:
 
@@ -215,6 +242,4 @@ rq1 <- rq(Y ~ X + C1 + C2, data = dat, tau = 0.5)
 summary(rq1)
 ```
 
-That's better. Is this a potential clue I wonder... Some genre of skew or heteroskedasticity that's dragging the estimate above 1...?
-
-
+That's also better. Is this a potential clue I wonder... Some genre of skew or heteroskedasticity that's dragging the estimate above 1...?
