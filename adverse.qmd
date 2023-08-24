@@ -1,7 +1,7 @@
 ---
 title: "Exploring Preston and Gilthorpe's adversarial example"
 author: "@Andi@tech.lgbt"
-date: 2022-08-23
+date: 2022-08-24
 format:
   html:
     embed-resources: true
@@ -16,6 +16,8 @@ library(MatchIt)
 library(marginaleffects)
 library(GGally)
 library(cobalt)
+library(mgcv)
+library(quantreg)
 ```
 
 
@@ -64,23 +66,23 @@ solution <- read.table("solution.csv",
   unvectorise_data(2)
 ```
 
-Next, set the outcome variable (I think this is correct):
+Next, set the outcome variable:
 
 ```{r}
 set_Y <- function(data, intercept, coeffs, residuals) {
-  coeffs_dot <- data %>%
+  coeffs_dot <- data |>
     select(starts_with("C")) %>%
     `*`(matrix(
       coeffs,
       nrow = N,
       ncol = length(coeffs),
       byrow = TRUE
-    )) %>%
-    transmute(dot = rowSums(across())) %>%
+    )) |>
+    transmute(dot = rowSums(across())) |>
     as.list() %>%
     `$`("dot")
 
-  data %>%
+  data |>
     mutate(Y = X + coeffs_dot + intercept + residuals)
 }
 
@@ -102,7 +104,7 @@ ggpairs(dat, columns = c("C1", "C2", "Y"), aes(colour = factor(X), alpha = .5))
 ```
 
 
-Hmmmmmm so it looks like the relationship between *C2* and *Y* depends on *X*: positve correlation for *X*=1 and negative for *X*=0. There's something odd going on with the relationship between *C1* and *C2*: the sign flips depending on *X*, also looks heteroskedastic.
+The relationship between *C2* and *Y* depends on *X*: positve correlation for *X*=1 and negative for *X*=0. There's something odd going on with the relationship between *C1* and *C2*: the sign flips depending on *X*, also looks heteroskedastic.
 
 Try to deal with interaction:
 
@@ -183,15 +185,36 @@ avg_comparisons(outmod,
                 wts = "weights")
 ```
 
-We're told the true answer is 1 but this is above that... what's going on...? Must be clues back in the original pairs plot.
+We're told the true answer is 1 but this estimate is greater than that... what's going on...? Must be clues back in the original pairs plot.
 
 Wondering what the ATE looks like from the regression model where the covariates are at their means:
 
 ```{r}
-lm(Y ~ X * (scale(C1) + scale(C2)), data = mutate(dat, X = as.factor(X))) |>
+lm(Y ~ X * (scale(C1) + scale(C2)), data = dat) |>
   confint()
 ```
 
 Still over 1.
+
+Try the obvious:
+
+```{r}
+lm(Y ~ X, data = dat) |>
+  confint()
+```
+
+```{r}
+lm(Y ~ X + C1 + C2, data = dat) |>
+  confint()
+```
+
+How about fitting a quantile regression model instead, at the median:
+
+```{r}
+rq1 <- rq(Y ~ X + C1 + C2, data = dat, tau = 0.5)
+summary(rq1)
+```
+
+That's better. Is this a potential clue I wonder... Some genre of skew or heteroskedasticity that's dragging the estimate above 1...?
 
 
