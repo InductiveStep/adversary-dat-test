@@ -1,0 +1,197 @@
+---
+title: "Exploring Preston and Gilthorpe's adversarial example"
+author: "@Andi@tech.lgbt"
+date: 2022-08-23
+format:
+  html:
+    embed-resources: true
+---
+
+```{r}
+#| warning: false
+library(tidyverse)
+library(magrittr)
+library(car)
+library(MatchIt)
+library(marginaleffects)
+library(GGally)
+library(cobalt)
+```
+
+
+Poking around the solution for *Using optimisation methods to generate adversarial datasets for propensity score methods with large post-adjustment bias*, available [yonder](https://osf.io/d279k/). First, get the data. The following code is hiked out of the Rmd provided by the authors.
+
+```{r}
+N <- 2 * 100
+
+partition <- function(xs, k) {
+  n <- length(xs)
+  split(xs, rep(1:ceiling(n / k), each = k)[1:n])
+}
+
+unvectorise_data <- function(v, confounders) {
+  data_length <- N * confounders
+  intercept_length <- 1
+  coeffs_length <- confounders
+  residuals_length <- N
+
+  data_v <- v[seq(1, data_length)]
+  data_series <- partition(data_v, N)
+  names(data_series) %<>% lapply(partial(paste0, "C")) |> unlist()
+  data <- as_tibble(data_series)
+
+  data %<>% mutate(X = c(rep(0, N / 2), rep(1, N / 2)))
+
+  intercept <- v[data_length + 1]
+  coeffs <- v[seq(data_length + intercept_length + 1,
+                  data_length + intercept_length + coeffs_length)]
+  residuals <- v[seq(
+    data_length + intercept_length + coeffs_length + 1,
+    data_length + intercept_length + coeffs_length + residuals_length
+  )]
+  list(
+    data = data,
+    intercept = intercept,
+    coeffs = coeffs,
+    residuals = residuals
+  )
+}
+
+solution <- read.table("solution.csv",
+                       header = TRUE,
+                       row.names = 1) |>
+  as.matrix() |>
+  unvectorise_data(2)
+```
+
+Next, set the outcome variable (I think this is correct):
+
+```{r}
+set_Y <- function(data, intercept, coeffs, residuals) {
+  coeffs_dot <- data %>%
+    select(starts_with("C")) %>%
+    `*`(matrix(
+      coeffs,
+      nrow = N,
+      ncol = length(coeffs),
+      byrow = TRUE
+    )) %>%
+    transmute(dot = rowSums(across())) %>%
+    as.list() %>%
+    `$`("dot")
+
+  data %>%
+    mutate(Y = X + coeffs_dot + intercept + residuals)
+}
+
+dat <- with(solution,
+            set_Y(data, intercept, coeffs, residuals))
+```
+
+Take a peek:
+
+```{r}
+dat
+```
+
+
+Let's see how the covariates relate to the outcome, conditional on *X*:
+
+```{r}
+ggpairs(dat, columns = c("C1", "C2", "Y"), aes(colour = factor(X), alpha = .5))
+```
+
+
+Hmmmmmm so it looks like the relationship between *C2* and *Y* depends on *X*: positve correlation for *X*=1 and negative for *X*=0. There's something odd going on with the relationship between *C1* and *C2*: the sign flips depending on *X*, also looks heteroskedastic.
+
+Try to deal with interaction:
+
+```{r}
+mod <- lm(Y ~ X * (C1 + C2), data = mutate(dat, X = as.factor(X)))
+```
+
+```{r}
+summary(mod)
+```
+
+So we probably can't ignore it...
+
+
+```{r}
+residualPlots(mod)
+```
+
+
+There's a quadratic (maybe) relationship between C2 and residuals.
+
+
+Let's try CEM, ignoring this, and without covariate adjustment in the outcome model.
+
+
+```{r}
+match_cem <- matchit(X  ~ C1 + C2,
+                     method = "cem",
+                     data = dat,
+                     estimand = "ATT")
+match_cem_dat <- match.data(match_cem)
+```
+
+```{r}
+match_cem
+```
+
+First look at the ASMD:
+
+```{r}
+love.plot(match_cem, 
+          drop.distance = TRUE, 
+          var.order = "unadjusted",
+          abs = TRUE,
+          thresholds = c(m = .1))
+```
+
+
+Matching improved balance.
+
+Density plots:
+
+```{r}
+bal.plot(X ~ C1, data = dat, 
+         weights = list(CEM = match_cem),
+         var.name = "C1", which = "both")
+```
+
+
+```{r}
+bal.plot(X ~ C2, data = dat, 
+         weights = list(CEM = match_cem),
+         var.name = "C2", which = "both")
+```
+
+
+Also looks improved.
+
+Outcome model:
+
+```{r}
+outmod <- lm(Y ~ X, data = match_cem_dat, weights = weights)
+
+avg_comparisons(outmod,
+                variables = "X",
+                vcov = ~subclass,
+                newdata = subset(match_cem_dat, X == 1),
+                wts = "weights")
+```
+
+We're told the true answer is 1 but this is above that... what's going on...? Must be clues back in the original pairs plot.
+
+Wondering what the ATE looks like from the regression model where the covariates are at their means:
+
+```{r}
+lm(Y ~ X * (scale(C1) + scale(C2)), data = mutate(dat, X = as.factor(X))) |>
+  confint()
+```
+
+Still over 1.
+
+

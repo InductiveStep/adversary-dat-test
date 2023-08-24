@@ -1,0 +1,1329 @@
+---
+title: 'Using optimisation methods to generate adversarial datasets for propensity score methods with large post-adjustment bias'
+author:
+  - name: 'John L. Preston'
+    email: 'j.preston2752@student.leedsbeckett.ac.uk'
+    corresponding_author: TRUE # Automatic footnote using corresponding_author
+    affiliation:
+      - LBUOI
+  - name: 'Mark S. Gilthorpe'
+    affiliation: LBUOI
+address:
+  - code: LBUOI
+    department: Obesity Institute
+    organization: Leeds Beckett University
+    street: Headingley Campus
+    city: Leeds
+    postcode: LS6 3QS
+    country: United Kingdom
+# footnote:
+#   - code: 1
+#     text: "Equal contribution"
+#   - code: 2
+#     text: "Current email address: [cat@example.com](mailto:cat@example.com)"
+abstract:
+  - "Propensity score methods are a popular set of approaches for estimating the causal effect of an exposure on an outcome when working with observational data. In this paper we make use of optimisation methods to generate a low-dimensional dataset which can pass typical robustness checks used when applying propensity score methods, but which nevertheless leads to more biased estimates of the causal effect when compared to inferences made on the original data prior to propensity score adjustment. We discuss potential strategies to address this issue and directions for future research"
+keywords:
+  - adversarial datasets
+  - balance diagnostics
+  - causal inference
+  - optimisation
+  - propensity scores
+competing_interests: |
+  There are no competing interest.
+author_contributions: |
+  JP:  Conceptualization, Methodology, Software, Validation, Formal analysis, Investigation, Writing - Original Draft, Writing - Review & Editing, Visualization, Project administration. MG: Supervision, Writing - Review & Editing.
+bibliography: '../../library.bib' # Includes refs in OUP example template
+## When using `citation_package = "default"`, a CSL file can be used
+csl: https://www.zotero.org/styles/oxford-university-press-note
+output:
+  rticles::oup_article:
+    latex_engine: xelatex
+    oup_version: 1 # 1 = 2020 CTAN OUP CLS package; 0 = 2009 OUP CLS package
+    journal: "Series B (Statistical Methodology)"
+    document_style: "contemporary" # Can be contemporary, modern, traditional
+    papersize: "large" # Can be large, medium, small
+    citation_package: "default" # Uncomment when using a CSL; default "natbib"
+    namedate: TRUE # Set FALSE to use numeric refs; Default FALSE
+    #number_sections: FALSE # Uncomment to not number sections; default TRUE
+    #number_lines: TRUE # Use `lineno` package - Default FALSE
+    #number_lines_options: ["mathlines","switch"]  # Options for latex lineno package.
+    onecolumn: TRUE # Uncomment for one column format; default FALSE
+    extra_dependencies:
+      - booktabs # to use with knitr::kable() example below
+
+## Example of pandoc's variable
+#urlcolor: orange
+#linkcolor: green
+#citecolor: red
+header-includes:
+  - \usepackage{svg}
+  - \usepackage[nomarkers,tablesfirst]{endfloat} # For figures and tables at end
+  - \theoremstyle{thmstyleone} # Theorem stuff from OUP template
+  - \newtheorem{theorem}{Theorem} #  meant for continuous numbers. %%\newtheorem{theorem}{Theorem}[section] # meant for sectionwise numbers. optional argument [theorem] produces theorem numbering sequence instead of independent numbers for Proposition
+  - \newtheorem{proposition}[theorem]{Proposition} # %%\newtheorem{proposition}{Proposition}" # to get separate numbers for theorem and proposition etc.
+  - \theoremstyle{thmstyletwo}
+  - \newtheorem{example}{Example}
+  - \newtheorem{remark}{Remark}
+  - \theoremstyle{thmstylethree}
+  - \newtheorem{definition}{Definition}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, # By default, hide code; set to TRUE to see code
+  fig.pos = 'th', # Places figures at top or here
+  out.width = '100%', dpi = 300, # Figure resolution and size
+  fig.env="figure"
+) # Latex figure environment
+
+options(knitr.table.format = "latex") # For kable tables to write LaTeX table directly
+```
+
+```{r libs, echo = FALSE, include = FALSE}
+library(akima)
+library(boot)
+library(broom)
+library(DiagrammeR)
+library(doParallel)
+library(doRNG)
+library(GA)
+library(gbm)
+library(gt)
+library(knitr)
+library(magrittr)
+library(MatchIt)
+library(optmatch)
+library(parallel)
+library(purrr)
+library(quantreg)
+library(Rfast)
+library(tidyverse)
+```
+
+# Introduction and aims
+
+Propensity score methods are often used to estimate causal effects within observational data, especially where the exposure of interest is binary. Although technically equivalent in many instances to adjusting for all confounders explicitly within the modelling process, propensity score methods are often more parsimonious and thus useful when dealing with many confounders [@guoPropensityScoreAnalysis2020]. Propensity scores also facilitate the assessment of positivity violations through evaluation of the derived score distributions for the exposed and unexposed groups. This is most frequently done by first creating a model for the propensity score, the probability of exposure conditional on all confounding covariates, and then using this propensity score to construct exposed and unexposed groups with similar distributions of covariates.
+
+The aim of this paper is to investigate the reliability of common propensity score methods using optimisation methods, to generate a dataset which can pass typical robustness checks used when applying propensity score methods, but which results in more biased estimates of the causal effect when compared to inferences made on the original data prior to propensity score adjustment. We demonstrate that 'adversarial datasets', as we term them, can arise even in the low dimensional case with a single binary exposure variable, a single continuous outcome variable, and two continuous confounding variables. This finding poses a threat to the use of propensity score methods in real world contexts, because the adversarial dataset we have derived has no obvious properties or tests which indicate that it is unsuitable for propensity score approaches. It is likely that observational datasets occur for which the use of propensity score methods are unsuitable, yet this may not be identifiable.
+
+Our investigation into this question was sparked by the understanding that when performing propensity score matching (PSM), it is possible for an exposed-unexposed pair to have identical propensity scores even if their covariates are substantially different. For example, consider that we wish to estimate the effect of wearing sunscreen on skin cancer incidence. Two confounders for this exposure-outcome relationship are skin colour and skin oiliness: people with lighter skin are at higher risk of sunburn and are more motivated to wear sunscreen; and people with oily skin may be unwilling to wear sunscreen because they find it unpleasant. Thus it is possible that a dark skinned individual with dry skin and a light skinned individual with oily skin could share the same propensity score, despite having completely different values for their covariates. Geometrically, if we imagine the covariates as creating an n-dimensional space, with each point in the space representing a single combination of all covariates, in this example two opposite corners of the covariate space will be assigned identical propensity scores. Importantly, in this example, although the propensity score may match individuals who have the same likelihood of exposure (wearing sunscreen), these individuals will have very different outcomes, because skin colour has a much more pronounced effect on skin cancer incidence than skin oiliness. More generally, _by reducing the dimensionality of the covariates into a scalar, the propensity score discards information about the distribution of individuals within the covariate space, which can lead to insufficient or erroneous adjustment of exposure-outcome confounding_.
+
+The structure of this paper is as follows. The [Background] section provides an overview of causal inference approaches in general, with a discussion of the different philosophies behind experimental and observational approaches, along with further information on covariate matching, the propensity score, and the common propensity score methods which we evaluated through simulation. We also include information on adversarial examples from the machine learning literature, which we use as a framing for our research, and we include an overview of optimisation and genetic algorithms, as these are the methods used for generating our adversarial dataset. The [Methods] section shows how we constructed an optimisation problem to generate our adversarial dataset. The [Results] section illustrates a biased causal effect estimate arising from our post-adjustment adversarial dataset, and provides a narrative, graphical, and numeric investigation of the dataset, demonstrating how it passes conventional robustness tests commonly applied when using propensity score approaches. The [Discussion] section describes the significance of our findings and outlines new research questions and opportunities for further research that are prompted by our findings. Finally, the [Conclusion] provides a narrative summary of our results, their consequences, and reiterates the need for further research in this area.
+
+# Background
+
+## Estimation of causal effects
+
+Many professions, including researchers and policy-makers, are interested in the causal effect of an exposure, intervention, or treatment, on one or more outcomes. Regression methods can be used to determine correlations between two or more variables, but by themselves these methods are not capable of distinguishing the direction of a causal relationship, or distinguishing between true and spurious causal relationships. In order to understand causal relationships, it is necessary for us to apply certain constraints to our data generating processes (DGPs) so that we can interpret our data correctly. [@hernanDoesObesityShorten2008]
+
+Randomised controlled trials (RCTs) are one such approach for constraining a DGP. With an RCT, we sample a population to create exposed and unexposed groups with similar characteristics and therefore similar mean prognostic outcomes [@rubinEstimatingCausalEffects1974], and we expose only one of those groups to our exposure of interest. Because RCTs randomise the individuals in our sample into different exposure regimes, we can be certain that even if there are unobserved factors which might have influenced the exposure or the outcome, with a large enough sample size these unobserved factors will be distributed evenly between the two groups and their influence on our estimate of the causal effect of the exposure on the outcome, or bias, will be close to zero.
+
+When working with observational data, where we cannot control the exposure of individuals directly, it is instead necessary to measure any confounding variables (defined as the set of variables which may be causally linked to both the exposure and the outcome) and to condition on these confounders using statistical methods such as regression analysis. @williamsonPropensityScoresNaive2012 provided an example of a study to determine the effect of maternal breastfeeding on infant neurodevelopment. They presented a hypothetical dataset of IQ measures for children from low and high socioeconomic status (SES) backgrounds, some of which are exposed (breastfed) and some of which are unexposed (not breastfed). The causal effect of breastfeeding on IQ can be estimated by comparing the means of the exposed and unexposed groups. However, because SES is likely to affect both the exposure and the outcome, it is necessary to stratify the dataset into high SES and low SES groups, so that the marginal (i.e. averaged over SES backgrounds) estimated effect is not biased due to differences in SES between the exposed and unexposed groups.
+
+This procedure within regression is known as _covariate adjustment_, and in theory, assuming all confounders are measured and adjusted for, provides an unbiased estimate of the total average causal effect of the exposure on the outcome, equal to the estimate we would obtain from a randomised experiment [@rubinEstimatingCausalEffects1974]. In practice, however, full adjustment is almost always impossible, and even when all confounders are known and measured, _residual confounding_ will remain which causes the effect estimate to be biased [@kaufmanSocioeconomicStatusHealth1997]. In this example, representing the SES as a categorical variable is problematic because it eliminates within-category variation, and assumes that the SES would only affect an individual's exposure or outcome if they were to cross the threshold which separates the two categories. This is a highly nonlinear relationship and it would be more realistic and accurate to model SES as a continuous variable, which could then be adjusted for using other methods such as _linear regression adjustment_ or _covariate matching_ [@cochranControllingBiasObservational1973].
+
+## Covariate matching
+
+Covariate matching is a common approach to causal effect estimation when working with observational data. Although it can successfully recover accurate estimates of a causal effect much as an RCT can, matching and randomisation achieve this through different assumptions and philosophies of causality. We refer readers to @rubinEstimatingCausalEffects1974 for a more thorough discussion of these differences.
+
+The intuition behind covariate matching is that, if an exposed and a control individual have very similar values for their covariates and therefore only differ substantially in their exposure, the distributions of their potential outcomes should also be similar. Assuming there are no unmeasured confounders, and we have a large sample of exposed and unexposed individuals for every possible value of covariates, it is possible to estimate the causal effect of the exposure on the outcome by comparing the mean outcomes of the two groups.
+
+The _Mahalanobis distance_ is a covariance- and mean-adjusted measure of the difference between two individuals across all covariates. If two individuals have a small Mahalanobis distance, they have similar values across their covariates. Thus matching pairs across exposure regimes by their Mahalanobis distance is one way to perform covariate matching.
+
+Although covariate matching and Mahalanobis distance matching can be intuitive and reliable, they are often difficult to apply in practice due to the high dimensionality of many practical settings. The dataset may not contain exposed and unexposed individuals who are nearly identical across all covariates. However, it may still be possible to determine an unbiased estimate of the causal effect of an exposure by matching individuals using other metrics which account for the confounding effect of other covariates on the exposure and the outcome, such as the propensity score.
+
+## Balancing scores and the propensity score
+
+_Balancing scores_ and the _propensity score_ were introduced by @rosenbaumCentralRolePropensity1983. A balancing score is any function of the covariates such that the conditional distribution of those covariates at each value of the balancing score is equal for both the exposed and unexposed groups. In other words, conditioning on the balancing score removes variation in the covariate joint distribution between the exposure regimes. The propensity score is one such balancing score and is defined as the conditional probability of treatment assignment given other covariates, which we may write as $e(\mathbf{x}) \equiv \mathbb{P}(Z = 1 | X = \mathbf{x})$ where $Z = 1$ indicates exposure; $Z = 0$ indicates non-exposure; and $X = x$ provides the vector of covariates.
+
+Balancing scores require the strongly ignorable treatment assignment (SITA) assumption, which specifies that the observed and counterfactual outcomes for all individuals are independent of their exposure regime, given the covariates, and that for every value of those covariates there is a non-zero probability of exposure. In an RCT the SITA assumption holds trivially because the exposure assignment is perfectly randomised by a process that is completely independent of every subject's covariates. However, in an observational study, we know that some covariates will have a causal effect on exposure. Therefore, in an observational study, SITA requires that all covariates that could affect the exposure have been measured; that it is possible for us to sample both an exposed and an unexposed individual for any given values of covariates; and that a change in the outcome for any individual can only be caused by a change in the exposure regime. These implications of the SITA assumption are fundamentally untestable in practice and a source of great difficulty in the construction of robust causal analyses of observational data. [@hernanCausalInference2020, pp. 25-41]
+
+@rosenbaumCentralRolePropensity1983 proved that in the large sample case, and also assuming SITA, if an exposed and an unexposed individual are sampled from the population at a fixed value of the propensity score, then the expected difference in outcome for those individuals is equal to the average treatment effect for the population at that value of the propensity score. In the notation of the potential outcomes framework of @rubinEstimatingCausalEffects1974, we can express this as $\mathbb{E}[Y_1 | e(X), Z = 1] - \mathbb{E}[Y_0 | e(X), Z = 0] = \mathbb{E}[Y_1 - Y_0 | e(X)]$ where $Z = 1$ indicates exposure and $Z = 0$ indicates non-exposure.
+
+## Propensity score methods
+
+Propensity scores can be derived for a dataset using standard regression approaches. Once the propensity score for each observation has been calculated, there are various methods that can be used to rebalance the dataset such that the propensity distributions of the exposed and unexposed groups are equal.
+
+Many of these methods result in the generation of _sampling weights_. which must be used as part of any further analysis through methods such as weighted regression or by creating a pseudopopulation (creating a new, much larger sample through weighted resampling of the original weighted sample with replacement, followed by discarding of the weights). The weights account for both the relative importance of each observation in creating balanced exposure regimes, and for multiple use of a observation within any particular propensity score method.
+
+We now briefly describe the propensity score methods we have evaluated as part of this research. For more information on these methods we refer readers to @stuartMatchingMethodsCausal2010 and @guoPropensityScoreAnalysis2020.
+
+### Nearest neighbour within-caliper matching
+
+Nearest neighbour matching aims to match each exposed individual to one or more unexposed individuals by choosing those unexposed individuals with the smallest absolute difference in propensity score from the given exposed individual. The within-caliper variant refers to an upper limit on the maximum absolute difference in propensity scores, above which we could consider a match to be questionable.
+
+Nearest neighbour (within-caliper) matching is stochastic in that the order in which exposed individuals are selected and matched to is random, and so it is possible for the matching rate, quality, and subsequent results to vary across applications of this method. For this reason this method is usually coupled with a bootstrap approach which allows correct estimation of means and variances.
+
+Nearest neighbour (within-caliper) matching can be performed either with or without replacement, allowing a choice of a single exposed individual to be matched to one or many unexposed individuals. Matching with replacement can reduce bias by reducing the mean absolute difference in propensity scores of matched sets of individuals, although the total number of unique matched unexposed individuals needs to be checked, as it is possible for this method to select a small number of unexposed individuals which may lead to questionable inferences.
+
+### Optimal full matching
+
+Optimal matching is a variant of nearest neighbour matching which arranges exposed and unexposed individuals into matched sets to minimise the sum of absolute differences in propensity scores across all matched sets. Optimal full matching is a specific case of optimal matching where all individuals within both exposed and unexposed samples appear in at least one such matched set, such that no observations are discarded. This contrasts with nearest neighbour within-caliper matching, where depending on the dataset and the matching order, it is possible for some individuals to be discarded if the minimum absolute distance across all possible pairs exceeds the caliper.
+
+### Coarsened exact matching
+
+Exact matching attempts to find pairs of exposed-unexposed individuals who are identical in terms of their covariates, i.e. strict covariate matching. In practice this is extremely difficult with continuous variables because it is unlikely that any two individuals will have the exact same value for a given covariate. Coarsened exact matching applies coarsening algorithms to create a set of bins for each covariate and then individuals are matched if they fall within the same set of bins across all covariates.
+
+Although the propensity score does not have to be calculated for coarsened exact matching, as this method can be applied to the covariates directly, it is still considered as part of the propensity score literature because the resulting similarity in the covariate values for the matched groups should result in similar propensity scores.
+
+### Subclassification
+
+Broadly, subclassification refers to the process of binning a set of data as in coarsened exact matching. However, in the propensity score literature it specifically refers to subclassification on the propensity score itself. The propensity scores are calculated, and then these scores are split into some number of discrete and non-overlapping subclasses or strata. Once each observation is assigned to a single subclass/stratum, the causal estimand can be estimated for each subclass independently, and these estimates can be combined through a weighted average to determine the overall causal effect.
+
+### Inverse probability weighting
+
+With inverse probability weighting, the propensity score is used to directly calculate a sampling weight for each observation according to a formula defined by the causal estimand.
+
+Unlike the other methods described earlier, inverse probability weighting is not a matching method, and no attempt is made to pair or match individuals across treatment regimes. Instead, all individuals are retained, and their weights capture all information required to balance the different exposure regimes.
+
+However, it is possible for some individuals to have very large weights calculated, in which case they would be overrepresented relative to the rest of the sample. For this reason it is important to check the distributions of weights after they have been calculated, and it may be necessary to prune individuals with very large weights.
+
+## Balance diagnostics
+
+Since the purpose of propensity score methods are to create a balanced distribution of covariates between the exposed and unexposed groups to improve the accuracy of estimates of causal effects, it is necessary to compare the distributions of the covariates after adjustment, to ensure that the chosen method has been successful, and to determine the population for which the estimate can be reasonably expected to be valid.
+
+We now briefly describe the most commonly used balance diagnostics as per @zhangBalanceDiagnosticsPropensity2019, and we refer readers to this paper and to @austinBalanceDiagnosticsComparing2009 and @stuartMatchingMethodsCausal2010 for further information.
+
+### Common support
+
+Common support refers to the overlap of propensity score distributions across the exposed and unexposed samples. In order to support valid inferences, the distribution of propensity scores in both the unmatched and the matched datasets should: have a sufficient range over the unit interval $[0, 1]$; be largely continuous with no wide 'holes' of zero or low density (which would correspond to regions of the propensity score distribution with no or very few individuals); and have the majority of their ranges overlapping, such that for most regions of the propensity score distribution there are both exposed and unexposed individuals.
+
+Further, after applying propensity score methods, the density of the propensity score distributions of the different exposure regime groups should be very similar, such that for any region of the propensity score, the (weighted) density of exposed and unexposed individuals are almost identical.
+
+### Standardised mean differences of covariates
+
+The standardised mean difference (SMD) for a covariate is the difference in means between the exposed and unexposed group, divided by the square root of one half of the sum of variances of the two groups:
+
+$$
+\frac{\mu_{X = 1} - \mu_{X = 0}}{\sqrt{\frac{\sigma^2_{X = 1} + \sigma^2_{X = 0}}{2}}}
+$$
+
+The SMD was proposed by @austinBalanceDiagnosticsComparing2009 as a propensity score balance diagnostic and it is identical to _Cohen's d_ when used as a measure of effect size. The SMD is scale and sample size invariant and provides a measure of the difference in means across exposure regime groups. However, it does not measure any other properties of the distribution, including modality. Further, this metric does not reveal differences in the joint covariate distribution, unless specific interactions terms are computed and compared.
+
+### Variance ratios
+
+@austinBalanceDiagnosticsComparing2009 also demonstrates the use of variance ratios (VR) between exposed and unexposed groups as an additional diagnostic. If the SMD for a covariate is close to zero and the corresponding VR is close to one, this indicates that the two groups have similar mean and spread. However, this still does not account for modality or 'lumpiness' in the distributions.
+
+### Five number summaries
+
+The final set of diagnostics proposed by @austinBalanceDiagnosticsComparing2009 are 'five number summaries', or measures of the five statistics which define the quartiles of the distribution (minimum, 25% value, median, 75% value, maximum). These statistics allow for greater description of the shape of the distribution and they can describe some multimodal distributions. Rather than directly comparing these numbers, researchers can take differences much like the SMD and look to see how close these differences are to the ideal of zero.
+
+### Standardised mean difference of the prognostic score
+
+The prognostic score was introduced by @hansenPrognosticAnaloguePropensity2008 and is a measure of the baseline outcome independent of exposure. Formally, we can write the prognostic score as $\Psi(\mathbf{x}) \equiv \mathbb{P}(Y | X = \mathbf{x})$. The prognostic score can be estimated by fitting a predictive model of the outcome as a function of the covariates $Y \sim X$ on the unexposed observations, and then using this fitted model to predict the prognostic outcomes for the exposed individuals. These prognostic outcomes are the predicted counterfactual outcomes of the exposed individuals had they not been exposed.
+
+@stuartPrognosticScoreBased2013 demonstrates the use of the prognostic score as a further balance diagnostic, and demonstrates that the absolute standardised mean difference of the prognostic score between exposed and unexposed groups is strongly correlated with bias. This is because a small absolute standardised mean difference of the prognostic score would indicate that the mean outcomes of the two exposure regimes would be similar in the absence of any exposure. This could only occur if the two exposure regimes have a similar distribution of observations across the covariates which affect the baseline outcomes.
+
+## Adversarial examples and adversarial datasets
+
+Within the machine learning literature, an _adversarial example_ is an input which is derived by taking a correctly classified input (such as an input from the training set) and then adding a perturbation which is innocuous to a human observer, but which causes the model to incorrectly classify the input with high confidence, according to the model's own measure of confidence [@goodfellowExplainingHarnessingAdversarial2015].
+
+Drawing our inspiration from adversarial examples, we use the term _adversarial dataset_ to refer to a set of observations (points in a covariate space) which appear innocuous to a statistician and otherwise suitable for analysis using a statistical method, but which produces erroneous results when the analysis is conducted.
+
+## Optimisation problems and genetic algorithms
+
+Optimisation refers to a set of methods for numerically finding maxima (or equivalently minima) for functions. Because these methods are numerical, they do not require functions to be expressed in closed form, to have a smooth surface, or to be differentiable. Genetic algorithms are a set of optimisation methods influenced by evolution. These algorithms work by starting with a pool of randomly generated candidate solutions, determining their 'fitness' using a user-specified function, discarding the candidates with the lowest fitness, and then creating new candidates by randomly mutating and cross-breeding the best current candidates. In this way, genetic algorithms allow a computer to efficiently search a high dimensional space for solutions which maximise some arbitrary fitness function. A more complete description of optimisation and genetic algorithms is beyond the scope of this paper and we refer interested readers to @scruccaGAPackageGenetic2013, which describes the R package we have used.
+
+## Logistic regression and generalised boosted models
+
+@goodfellowExplainingHarnessingAdversarial2015 provide an explanation of adversarial examples based on the sensitivity of the vector dot product in high dimensional spaces. This indicates that logistic regressions are particularly vulnerable to bias in high dimensional cases where the errors of some covariates are correlated.
+
+Because our study makes use of optimisation methods to generate an adversarial dataset, there is a risk similar to that of _overfitting_, such that if our fitness function only estimates the propensity score using logistic regression via a generalised linear model (GLM), the optimisation algorithm may exploit this sensitivity in logistic regression to generate an adversarial dataset which produces biased causal estimates _only_ when the propensity score is estimated with a GLM, and not when the propensity score is estimated with other model types such as classification and regression trees (CART) or generalised boosted models (GBM).
+
+To ensure that our generated dataset is not overfitted against logistic regression with a GLM, we additionally investigate the use of generalised boosted models (GBM) in estimating the propensity score. @stuartMatchingMethodsCausal2010 points to a body of research indicating that CART and GBM offer good performance for estimating the propensity score, compared to the typical logistic regression approach. A full description of GBM is beyond the scope of this paper.
+
+# Methods
+
+In this simulation study we constructed adversarial datasets which cause various propensity score covariate adjustment methods to produce more biased estimates of a causal effect, compared to modelling against the original data without adjustment for confounding. To achieve this, we first developed a known true data generating process (DGP) which calculates an exact outcome for a given observation. We then formulated the simulation study as an optimisation problem, where the fitness of a dataset corresponded to the bias of the estimate of the causal effect relative to the known true effect. Within our fitness function, we encoded common criteria used by researchers when working with propensity score methods, which are supposed to indicate the success of the application. After optimising the fitness function within these constraints, we were able to generate a dataset which exhibits greater bias post-adjustment versus pre-adjustment. We now describe these components of our method in more detail.
+
+The data generating process (DGP) is given in Figure \ref{fig:dag}. We have a single binary treatment variable $X$ and a continuous outcome $Y$. Both $X$ and $Y$ are influenced by two continuous confounders $C_1$ and $C_2$. We set $X = 0$ for unexposed individuals and $X = 1$ for exposed individuals. Our confounders $C_1$ and $C_2$ are valued over the interval $[-1, 1]$. We use the subscript $i$ to indicate individuals/observations, and we specify the exact value of the outcome for each individual as $Y_i = X_i + \beta_1 C_{1,i} + \beta_2 C_{2,i} + \alpha + \eta_i$ where $X_i$ is the individual's exposure status; $\beta_1$ and $\beta_2$ are the coefficient for the confounders $C_1$ and $C_2$ respectively; $C_{1,i}$ and $C_{2,i}$ are the individual's value for the first and second confounders respectively; $\alpha$ is an intercept term, constant across all individuals; and $\eta_i$ is the error for the individual's outcome under the linear model. Note that the true causal effect of $X$ on $Y$ is constant across all individuals and valued at 1.0. We constrain the confounder coefficients and intercept to the interval $[-1, 1]$ to allow for both positive and negative effects. We constrain the residuals to a slightly narrower interval of $[-0.8, 0.8]$, to permit sufficient movement of the $Y$ value around the regression line, but also preventing a complete overlap between the exposed and unexposed groups. We constrain the individual confounder values to the open unit interval $[0, 1]$ to mimic positive real valued physical quantities with effective upper bounds such as weight or height. Therefore, our outcome $Y$ is constrained to the interval $[-2.8, 3.8]$.
+
+Because we have a closed form expression for our true DGP, it is possible for us to calculate the outcome $Y$ for any given values of the exposure $X$ and confounders $C_1$ and $C_2$.
+
+```{r dag, fig.cap='A directed acyclic graph representing the data generating processes for which we have constructed adversarial datasets.', echo = FALSE}
+# grViz("
+# digraph dag {
+#   graph [rankdir=LR];
+#   node [shape=square];
+#   C1 [label=<<I>C₁</I>>]
+#   C2 [label=<<I>C₂</I>>]
+#   X [label=<<I>X</I>>]
+#   Y [label=<<I>Y</I>>]
+#   // E1[shape=none  label='&#8942;' fontsize=30]
+#   {rank=same C1 C2}
+#   {C1, C2} -> {X, Y}
+#   X -> Y
+#   edge[style=invis]
+#   // C1->E1->Cn
+# }
+# ", width=300)
+knitr::include_graphics('dgp.svg')
+```
+
+Given a dataset of observations $(\mathbf{Y}, \mathbf{X}, \mathbf{C_1}, \mathbf{C_2})$ it is possible to fit a linear model $Y \sim X + C_1 + C_2$ such that the coefficient of the $X$ term provides an estimate of the causal effect of $X$ on $Y$, which we notate as $\hat{x}$. We define the _unadjusted bias_ as the difference between the true causal effect and the estimated causal effect from the unadjusted model, $1 - \hat{x}$. We can also consider an adjusted model after the application of some form of propensity score adjustment $(\mathbf{Y}^{PS}, \mathbf{X}^{PS}, \mathbf{C_1}^{PS}, \mathbf{C_2}^{PS})$, against which we can fit the same linear model to derive a post-adjustment estimate of the causal effect of $X$ on $Y$, which we notate as $\hat{x^{PS}}$. We define the _adjusted bias_ as the difference between the true causal effect and the estimated causal effect from the adjusted model, $1 - \hat{x^{PS}}$.
+
+```{r formula, echo = FALSE}
+# Our functions for building formulae are extensible to different numbers of
+# confounders.
+
+confounders_formula_part <- function (confounders) {
+  seq(1, confounders) %>%
+    sapply(partial(paste0, 'C')) %>%
+    paste0(collapse = ' + ')
+}
+
+Y_formula <- function (confounders) {
+  paste0('Y ~ X + ', confounders_formula_part(confounders)) %>% formula()
+}
+
+X_prop_formula <- function (confounders) {
+  paste0('X ~ ', confounders_formula_part(confounders)) %>% formula()
+}
+```
+
+```{r set-y, echo = FALSE}
+set_Y <- function (data, intercept, coeffs, residuals) {
+  coeffs_dot <- data %>%
+                  select(starts_with('C')) %>%
+                  `*`(
+                    matrix(
+                      coeffs,
+                      nrow = N,
+                      ncol = length(coeffs),
+                      byrow = TRUE
+                    )
+                  ) %>%
+                  transmute(dot = rowSums(across())) %>%
+                  as.list() %>%
+                  `$`('dot')
+
+  data %>%
+    mutate(
+      Y = X + coeffs_dot + intercept + residuals
+    )
+}
+```
+
+Given these definitions of bias, we formulated an optimization problem to maximise the adjusted bias subject to various constraints, which we describe next. In order to ensure our optimization problem was able to converge on a solution, we 'annealed' our constraint thresholds. The genetic algorithm was configured so that constraint thresholds would start at set values for the first 200 iterations, then these would be slightly increased for the next 200 iterations, and so on, until the final constraint thresholds were reached at iteration 20,000. From iteration 20,000 onwards, constraint thresholds were held at their target values and the genetic algorithm continued for another 20,000 iterations. This approach was developed after considerable trial and error in the choice of constraint thresholds and optimisation parameters such as population size.
+
+For our first constraint, we loosely constrained the absolute standardised mean differences (ASMD) of the confounders $C_1$ and $C_2$, such that the maximum ASMD should be below 0.05 at the end of the optimization. We chose this constraint value because it is smaller that the threshold of 0.1 used in @austinBalanceDiagnosticsComparing2009 and common in the literature, and therefore we feel this is a realistic threshold such that values within this range would not raise analytical suspicions. We feel that because the (A)SMD is such a common balance diagnostic, in some cases the only balance diagnostic, it is appropriate to consider a very tight constraint. Our initial constraint value was 0.2, to enable the optimisation process to navigate the space of datasets and gradually refine the result.
+
+```{r supersample, echo = FALSE}
+supersample <- function (data) {
+  if ('weights' %in% names(data)) {
+    data %<>% sample_n(
+      (1000 * nrow(data)) - 1,
+      replace = TRUE,
+      weight = data$weights
+    ) %>%
+      select(!weights)
+  }
+
+  data
+}
+```
+
+```{r std-diffs, echo = FALSE}
+smd <- function (X, C) {
+    (mean(C[X == 1]) - mean(C[X == 0])) / sqrt(
+      (var(C[X == 1]) + var(C[X == 0])) / 2
+    )
+}
+
+abs_smd <- function (X, C) {
+  abs(smd(X, C))
+}
+
+max_std_diffs <- function (data) {
+  data %<>% supersample()
+
+  std_diffs <- c(
+    abs_smd(data$X, data$C1),
+    abs_smd(data$X, data$C2)
+  )
+
+  max(std_diffs)
+}
+
+max_adj_std_diff <- c(0.2, 0.05)
+```
+
+We also constrained the ASMD of the estimated prognostic scores to be less than 0.05 at the end of the optimization. This is to preserve consistency with the ASMD constraint for the covariates, and it is a stricter threshold than that investigated by @stuartPrognosticScoreBased2013 in their initial investigation into the use of the prognostic score as a balance diagnostic. Our initial threshold for this constraint was also 0.2, again to allow the optimisation to gradually converge towards the intended threshold.
+
+```{r lm_weighted, echo = FALSE}
+lm_weighted <- function (formula, data, ...) {
+  if ('weights' %in% names(data)) {
+    lm(formula, data, weights = weights, ...)
+  } else {
+    lm(formula, data, ...)
+  }
+}
+```
+
+```{r prog_smd, echo = FALSE}
+prog_smd <- function (data) {
+  prog_model <- data %>%
+    filter(X == 0) %>%
+    lm_weighted(Y ~ C1 + C2, data = .)
+
+  data %<>%
+    mutate(
+      prog = predict(prog_model, newdata = .)
+    ) %>%
+    supersample()
+
+  smd(data$X, data$prog)
+}
+
+prog_abs_smd <- function (data) {
+  abs(prog_smd(data))
+}
+
+max_prog_abs_smd <- c(0.2, 0.05)
+```
+
+Second, we defined a function $f(a, b) = |\frac{a - b}{a + b}|$ and used this to constrain the variance ratios for the confounders. This function is equivalent to a scale-invariant measure of difference and must be close to zero if the ratio $\frac{b}{a}$ is close to one. To determine a threshold for this constraint, we consider the case where the confounders $C_1$ and $C_2$ are normally distributed with all observed values falling within the unit interval $[0, 1]$. We might estimate an upper bound for the variance of 0.04. @zhangBalanceDiagnosticsPropensity2019 states that "a variance ratio below 2 is generally acceptable", although we consider this to be too high, and so we have chosen our target maximum variance ratio as 1.25. This would permit a lower bound for the variance of 0.032, which would set an upper bound for our absolute variance difference function of $f(0.04, 0.032) = |\frac{0.008}{0.072}| = 0.\overline{1}$ Therefore we chose to constrain this absolute variance difference to a maximum of 0.1 at the end of the optimization. Our starting threshold was 0.4.
+
+```{r var_diff, echo = FALSE}
+abs_std_diff <- function (a, b) {
+  abs((a - b) / (a + b))
+}
+
+max_var_diff <- function (data) {
+  data %<>% supersample()
+
+  var_diffs <- data %>%
+    select(c(starts_with('C'), X)) %>%
+    group_by(X) %>%
+    summarise_all(c(var)) %>%
+    select(!X)
+
+  abs_std_diff(
+    slice(var_diffs, 1),
+    slice(var_diffs, 2)
+  ) %>%
+    max()
+}
+
+max_adj_var_diff <- c(0.4, 0.1)
+```
+
+Third, we loosely constrained the maximum of the absolute differences of the five summary statistics (minimum, 25% value, median, 75% value, maximum) between the exposed and unexposed groups, for each of the confounders, to be no greater than 0.05 at the end of the optimization. This threshold is informed by our 0.05 threshold for ASMD. Our starting threshold was 0.1.
+
+```{r quartiles, echo = FALSE}
+max_quartile_diff <- function (data) {
+  data %<>% supersample()
+
+  quartile_diffs <- data %>%
+    select(c(starts_with('C'), X)) %>%
+    group_by(X) %>%
+    summarise_all(
+      c(
+        min,
+        partial(quantile, probs = 0.25),
+        median,
+        partial(quantile, probs = 0.75),
+        max
+      )
+    ) %>%
+    select(!X)
+
+  abs(
+    slice(quartile_diffs, 1) - slice(quartile_diffs, 2)
+  ) %>%
+    max()
+}
+
+max_adj_quartile_diff <- c(0.1, 0.05)
+```
+
+Fourth, we wanted to ensure that there was a small amount of bias in the unadjusted model, as a small amount of bias without adjustment would be expected in a realistic dataset. We constrained the minimum difference to 0.05 at the end of the optimization, starting from 0.
+
+```{r lm-coeffs-dist, echo = FALSE}
+lm_effect_dist <- function (data, Y_formula) {
+  model <- lm_weighted(Y_formula, data)
+  abs(model$coefficients['X'] - 1)
+}
+
+min_orig_effect_dist <- c(0, 0.05)
+```
+
+Fifth, we encoded the common support condition by requiring that the sum of the median absolute deviations of the propensity scores for the exposed and unexposed groups were above a certain threshold $\text{MAD}[e(C_1, C_2 | X = 0)] + \text{MAD}[e(C_1, C_2 | X = 1)] \geq \tau$. If this number is large, then each exposure regime has a good spread across the unit interval of the propensity score, and therefore there must also be suitable overlap. We constrained this threshold $\tau$ to be at least 0.37 at the end of the optimization. This is based on comparison with a normal distribution: if we were to plot the density of a normal distribution $\mathcal{N}(0.5, 0.37 / 2)$ we would see a suitable coverage of the unit interval with acceptable overlap. Our starting threshold value was 0.05.
+
+```{r score_range, echo = FALSE}
+score_range <- function (adj_data) {
+  if ('distance' %in% names(adj_data)) {
+    adj_data %>%
+      group_by(X) %>%
+      summarise(mad = mad(distance)) %>%
+      `$`('mad') %>%
+      sum()
+  } else {
+    min_score_range[2]
+  }
+}
+
+min_score_range <- c(0.05, 0.37)
+```
+
+Sixth, because nearest neighbour within-caliper matching will discard some unexposed observations due to matching with replacement, we require that the post-adjustment dataset contains at least 95% of the rows of the pre-adjustment dataset at the end of the optimization. This allows the matching process to discard up to 10% of the unexposed group. Our initial threshold value was 80%.
+
+```{r match-ratio, echo = FALSE}
+match_ratio <- function (adj_data, data) {
+  nrow(adj_data) / nrow(data)
+}
+
+min_match_ratio <- c(0.8, 0.95)
+```
+
+The propensity score methods that we have evaluated all generate sampling weights as part of the adjustment process. It is possible for some individuals in the dataset to be given very large weights, which may indicate that these individuals are outliers and cannot be reliably included in the analysis. To prevent this scenario from occurring, we also constrained the ratio of the maximum and minimum weights to not exceed 100 at the end of the optimization, starting from a threshold of 1000.
+
+```{r weights-ratio, echo = FALSE}
+weights_ratio <- function (data) {
+  if ('weights' %in% names(data)) {
+    max(data$weights, na.rm = TRUE) / min(data$weights, na.rm = TRUE)
+  } else {
+    max_weights_ratio[2]
+  }
+}
+
+max_weights_ratio <- c(1000, 100)
+```
+
+Finally, we loosely constrained the magnitude of the vector of means of the true errors to not exceed 0.05 at the end of the optimization, starting from a threshold of 0.2. These errors values correspond to the error term in the outcome model and represent the individual-level variation in the outcome for any given value of the covariates. It is a standard assumption in linear regression modelling of continuous outcomes that the errors are drawn from a normal distribution with mean zero. By constraining the mean of the errors towards zero we ensure that we can recover a causal estimate from the optimised dataset using linear regression.
+
+```{r resid-means, echo = FALSE}
+# TODO rename: error, not residual!
+
+resid_means <- function (data, residuals) {
+  data %>%
+    mutate(residual = residuals) %>%
+    supersample() %>%
+    group_by(X) %>%
+    summarise(mean = mean(residual)) %>%
+    `$`('mean') %>%
+    norm(type = '2')
+}
+
+max_resid_means <- c(0.2, 0.05)
+```
+
+The fitness function for our optimisation includes all these constraints as penalty terms such that the fitness of a given dataset is defined as the adjusted bias, minus the values of the different constraint measures with their respective penalties and thresholds. To ensure that we were able to generate a single dataset which was biased after adjustment using any of a range of different propensity score methods, for any given input dataset, our fitness function created five weighted datasets, using each of optimal full matching with generalised linear models (GLM) and gradient boosted models (GBM), inverse probability weighting with GBM and GLM, and coarsened exact matching. The fitness function then calculated the adjusted bias and constraint values for each of these weighted datasets and returned the minimum fitness value. We set a seed at the beginning of the optimisation run to provide reproducibility.
+
+For each scenario, we considered 200 individuals with 100 in each of the exposed and unexposed groups. This is quite a small sample size for both groups, but it is motivated by the limitations and slowness of our optimization process. Our genetic algorithm operates on vectors which describe the entire dataset, including the values of the confounders and errors for every observation in the dataset. Therefore it was infeasible for us to explore larger datasets in this study, and we point to the need for further studies in the [Discussion] section.
+
+```{r N, echo = FALSE}
+N <- 2 * 100
+```
+
+```{r unvectorise_data, echo = FALSE}
+partition <- function (xs, k) {
+  n <- length(xs)
+  split(xs, rep(1:ceiling(n / k), each = k)[1:n])
+}
+
+unvectorise_data <- function (v, confounders) {
+  data_length <- N * confounders
+  intercept_length <- 1
+  coeffs_length <- confounders
+  residuals_length <- N
+
+  data_v <- v[seq(1, data_length)]
+  data_series <- partition(data_v, N)
+  names(data_series) %<>% lapply(partial(paste0, 'C')) %>% unlist()
+  data <- as_tibble(data_series)
+
+  data %<>% mutate(
+    X = c(rep(0, N / 2), rep(1, N / 2))
+  )
+
+  intercept <- v[data_length + 1]
+  coeffs <- v[seq(
+                data_length + intercept_length + 1,
+                data_length + intercept_length + coeffs_length
+              )]
+  residuals <- v[seq(
+                  data_length + intercept_length + coeffs_length + 1,
+                  data_length + intercept_length + coeffs_length + residuals_length
+                )]
+  list(
+    data = data,
+    intercept = intercept,
+    coeffs = coeffs,
+    residuals = residuals
+  )
+}
+```
+
+```{r data-fns, echo = FALSE}
+model_fn_partial <- c(
+  'glm' = partial(glm, family = 'binomial'),
+  'gbm' = partial(gbm, distribution = 'bernoulli')
+)
+
+balancing_score_model <- function (data, score_formula, model_fn) {
+  model <- model_fn_partial[[model_fn]]
+  model(formula = score_formula, data = data)
+}
+
+prop_score <- function (data, prop_score_formula, model_fn) {
+  balancing_score_model(data, prop_score_formula, model_fn) %>%
+    predict(newdata = data, type = 'response')
+}
+
+weight <- function (data, score_formula_, score) {
+  data %>%
+    mutate(
+      distance = score,
+      weights = X + ((1 - X) * distance / (1 - distance)),
+    )
+}
+
+caliper_width <- 0.2
+nn_match_ratio <- 1
+
+match_nn_caliper <- function (data, score_formula, score, caliper = caliper_width) {
+  matchit(
+    score_formula,
+    method = 'nearest',
+    data = data,
+    distance = score,
+    link = 'logit',
+    estimand = 'ATT',
+    discard = 'none',
+    reestimate = FALSE,
+    replace = TRUE,
+    caliper = caliper,
+    std.caliper = TRUE,
+    ratio = nn_match_ratio
+  ) %>%
+    match.data()
+}
+
+subclasses <- 6
+
+match_subclass <- function (data, score_formula, score) {
+  matchit(
+    score_formula,
+    method = 'subclass',
+    data = data,
+    distance = score,
+    link = 'logit',
+    estimand = 'ATT',
+    discard = 'none',
+    reestimate = FALSE,
+    subclass = subclasses
+  ) %>%
+    match.data()
+}
+
+match_optimal_full <- function (data, score_formula, score) {
+  matchit(
+    score_formula,
+    method = 'full',
+    data = data,
+    distance = score,
+    link = 'logit',
+    estimand = 'ATT',
+    discard = 'none',
+    reestimate = FALSE,
+    caliper = NULL
+  ) %>%
+    match.data()
+}
+
+match_cem <- function (data, score_formula, score_) {
+  matchit(
+    score_formula,
+    method = 'cem',
+    data = data,
+    estimand = 'ATT'
+  ) %>%
+    match.data()
+}
+
+prop_match_nn_caliper <- function (data, confounders, model_fn) {
+  match_nn_caliper(
+    data,
+    X_prop_formula(confounders),
+    prop_score(data, X_prop_formula(confounders), model_fn)
+  )
+}
+
+prop_match_optimal_full <- function (data, confounders, model_fn) {
+  match_optimal_full(
+    data,
+    X_prop_formula(confounders),
+    prop_score(data, X_prop_formula(confounders), model_fn)
+  )
+}
+
+prop_match_cem <- function (data, confounders, model_fn_) {
+  match_cem(
+    data,
+    X_prop_formula(confounders),
+    NA
+  )
+}
+
+prop_match_subclass <- function (data, confounders, model_fn) {
+  match_subclass(
+    data,
+    X_prop_formula(confounders),
+    prop_score(data, X_prop_formula(confounders), model_fn)
+  )
+}
+
+prop_weight <- function (data, confounders, model_fn) {
+  weight(
+    data,
+    X_prop_formula(confounders),
+    prop_score(data, X_prop_formula(confounders), model_fn)
+  )
+}
+
+mahal_match_nn_caliper <- function (data, confounders, model_fn) {
+  # MatchIt requires calipers to be named when performing Mahalanobis distance
+  # matching.
+  mahal_calipers <- rep(caliper_width, confounders)
+  names(mahal_calipers) <- seq(1, confounders) %>% paste0("C", .)
+  match_nn_caliper(
+    data,
+    X_prop_formula(confounders),
+    'mahalanobis',
+    caliper = mahal_calipers
+  )
+}
+
+mahal_match_optimal_full <- function (data, confounders, model_fn) {
+  match_optimal_full(
+    data,
+    X_prop_formula(confounders),
+    'mahalanobis'
+  )
+}
+```
+
+```{r seed, echo = FALSE}
+seed <- 7576
+```
+
+```{r solve, eval = FALSE, echo = FALSE}
+max_residual <- 0.8
+
+penalty_mult <- 10000
+
+penalty_threshold <- function (thresholds, scale) {
+ thresholds[1] + (scale * (thresholds[2] - thresholds[1]))
+}
+
+fitness <- function (v, confounders, penalty_scale = 1) {
+  penalty <- 0
+
+  Y_formula <- Y_formula(confounders)
+
+  orig_data <- unvectorise_data(v, confounders)
+
+  orig_data$data %<>% set_Y(orig_data$intercept, orig_data$coeffs, orig_data$residuals)
+
+  penalty <- penalty + max(resid_means(orig_data$data, orig_data$residuals) - penalty_threshold(max_resid_means, penalty_scale), 0)
+
+  orig_effect_dist <- lm_effect_dist(orig_data$data, Y_formula)
+
+  penalty <- penalty + max(penalty_threshold(min_orig_effect_dist, penalty_scale) - orig_effect_dist, 0)
+
+  worst_adj_fitness <- tribble(
+    ~data_fn,                   ~model_fn,
+    'prop_match_optimal_full',  'gbm',
+    'prop_weight',              'gbm',
+    'prop_match_optimal_full',  'glm',
+    'prop_weight',              'glm',
+    'prop_match_cem',           NULL
+  ) %>%
+    as_tibble() %>%
+    rowwise() %>%
+    mutate(
+      data = list(get(data_fn)(orig_data$data, confounders, model_fn)),
+      std_diff = max_std_diffs(data),
+      var_diff = max_var_diff(data),
+      quartile_diff = max_quartile_diff(data),
+      prog_abs_smd = prog_abs_smd(data),
+      effect_dist = lm_effect_dist(data, Y_formula),
+      match_ratio = match_ratio(data, orig_data$data),
+      weights_ratio = weights_ratio(data),
+      score_range = score_range(data),
+      penalty = 0 +
+        max(std_diff - penalty_threshold(max_adj_std_diff, penalty_scale), 0) +
+        max(var_diff - penalty_threshold(max_adj_var_diff, penalty_scale), 0) +
+        max(quartile_diff - penalty_threshold(max_adj_quartile_diff, penalty_scale), 0) +
+        max(prog_abs_smd - penalty_threshold(max_prog_abs_smd, penalty_scale), 0) +
+        max(penalty_threshold(min_match_ratio, penalty_scale) - match_ratio, 0) +
+        max(weights_ratio - penalty_threshold(max_weights_ratio, penalty_scale), 0) * (1 / penalty_mult) +
+        max(penalty_threshold(min_score_range, penalty_scale) - score_range, 0),
+      fitness = effect_dist - (penalty * penalty_mult)
+    ) %>%
+    `$`('fitness') %>%
+    min()
+
+  worst_adj_fitness - (penalty * penalty_mult) - orig_effect_dist
+}
+
+lower <- function (confounders) {
+  c(rep(0, confounders * N), -1, rep(-1, confounders), rep(- max_residual, N))
+}
+
+upper <- function (confounders) {
+  c(rep(1, confounders * N), 1, rep(1, confounders), rep(max_residual, N))
+}
+
+# For debugging.
+rand_v <- function (confounders) {
+  rnorm(confounders * N + 1 + confounders + N)
+}
+
+run_ga <- function (confounders, suggestions = NULL, penalty_scale = 1) {
+  popSize <- 200
+
+  ga(
+    'real-valued',
+    fitness = partial(
+      fitness,
+      confounders = confounders,
+      penalty_scale = penalty_scale
+    ),
+    lower = lower(confounders),
+    upper = upper(confounders),
+    maxiter = 200,
+    popSize = popSize,
+    pcrossover = 0.3,
+    pmutation = 0.3,
+    elitism = floor(0.1 * popSize),
+    suggestions = suggestions,
+    parallel = TRUE
+  )
+}
+
+set.seed(seed)
+
+result <- NULL
+population <- NULL
+
+# population <- read.table(
+#   'population_200.csv',
+#   header = TRUE,
+#   row.names = 1
+# ) %>%
+#   as.matrix()
+
+for (i in 1:200) {
+  set.seed(seed)
+  cat("Loop ", i, "\n")
+  result <- run_ga(
+    2,
+    suggestions = if (is.null(population)) { NULL } else { population },
+    penalty_scale = min(i / 100, 1)
+  )
+
+  population <- result@population
+
+  write.table(population, paste0('population_', i, '.csv'))
+}
+
+write.table(result@solution, 'solution.csv')
+data <- result@solution %>% unvectorise_data(2)
+```
+
+Since some of the propensity score methods we tested required certain parameters to be specified, we document each of those choices here. For descriptions of how these different methods work, we refer the reader to the relevant sections of the Background.
+
+For nearest neighbour within-caliper matching, we use a caliper width of 0.2 standard deviations and a 1:1 matching ratio. We allow unexposed individuals to be replaced and paired with multiple observations in the exposed group, as this is a common choice in the literature, may decrease bias, and removes potential sensitivities introduced by the matching order [@stuartMatchingMethodsCausal2010].
+
+For subclassification we have chosen to use 6 subclasses, for two reasons. First, this is the default chosen by the MatchIt package we have used [@hoMatchItNonparametricPreprocessing2011] and therefore this choice allows us to explore the consequences of this parameter for studies which use this popular package and do not deliberately choose a different number of subclasses. Second, it has been shown that as few as 5 subclasses are sufficient for studies where exposure prevalence is large [@desaiPropensityscorebasedFineStratification2017], therefore given the structure of our simulation study 6 subclasses is sufficient.
+
+For inverse probability of treatment weighting, we have used the formula for the average treatment effect on the treated (ATT) as specified by @williamsonPropensityScoresNaive2012.
+
+# Results
+
+```{r load, eval = TRUE, echo = FALSE}
+data <- read.table(
+  'solution.csv',
+  header = TRUE,
+  row.names = 1
+) %>%
+  as.matrix() %>%
+  unvectorise_data(2)
+```
+
+Based on existing literature detailing common propensity score and covariate adjustment methods [@stuartMatchingMethodsCausal2010; @guoPropensityScoreAnalysis2020; @shibaUsingPropensityScores2021], we have examined the effect of adversarial datasets on the following methods:
+
+* Nearest neighbour within-caliper matching with replacement on the propensity score (`prop_match_nn_caliper`)
+* Optimal full matching on the propensity score (`prop_match_optimal_full`)
+* Coarsened exact matching on the confounders (`prop_match_cem`)
+* Subclassification on the propensity score (`prop_match_subclass`)
+* Inverse probability weighting on the propensity score (`prop_weight`)
+* Nearest neighbour within-caliper matching with replacement on the Mahalanobis distance (`mahal_match_nn_caliper`)
+* Optimal full matching on the Mahalanobis distance (`mahal_match_optimal_full`)
+
+For every scenario, we attempted to measure the ATT which, in the notation of the potential outcomes framework of @rubinEstimatingCausalEffects1974, we define as $\mathbb{E}[Y_1 - Y_0 | Z = 1]$.
+
+To demonstrate that our results targeted the adjustment methods rather than the logistic regression models used for computing the scores, and to explore the effect of different modelling approaches on the construction of adversarial datasets, we calculated the scores within each adjustment method using both generalised linear models (GLM) and generalised boosted models (GBM).
+
+All code and data used in this analysis is freely available on OSF at <https://osf.io/d279k/>, and we encourage interested readers to download and examine our adversarial dataset.
+
+We present the estimated parameters of the model values, followed by the estimates for our chosen balance diagnostics. We conclude the results with scatter plots which reveal the underlying datasets.
+
+```{r adv-stats, echo = FALSE}
+confounders <- c(2)
+data_fn_w_model <- c(
+  'prop_match_nn_caliper',
+  'prop_match_optimal_full',
+  'prop_match_subclass',
+  'prop_weight'
+)
+data_fn_wo_model <- c(
+  'prop_match_cem',
+  'mahal_match_nn_caliper',
+  'mahal_match_optimal_full'
+)
+data_fn <- c(data_fn_w_model, data_fn_wo_model)
+model_fn <- c(
+  'glm',
+  'gbm'
+)
+
+scenarios <- rbind(
+  expand.grid(
+    confounders = confounders,
+    data_fn = data_fn_w_model,
+    model_fn = model_fn,
+    stringsAsFactors = FALSE
+  ),
+  expand.grid(
+    confounders = confounders,
+    data_fn = data_fn_wo_model,
+    model_fn = NA,
+    stringsAsFactors = FALSE
+  )
+) %>%
+  as_tibble() %>%
+  rowwise() %>%
+  mutate(
+    name = c(
+      data_fn,
+      model_fn
+    ) %>%
+      na.omit() %>%
+      paste0(collapse = '_')
+  )
+
+data_orig <- function (data) {
+  if (is.null(data)) {
+    return(NULL)
+  }
+
+  set_Y(data$data, data$intercept, data$coeffs, data$residuals)
+}
+
+data_orig_v <- Vectorize(data_orig, SIMPLIFY = FALSE)
+
+data_adj <- function (data, adj_data_fn, model_fn) {
+  if (is.null(data)) {
+    return(NULL)
+  }
+
+  confounders <- length(data$coeffs)
+
+  data$data %<>% set_Y(data$intercept, data$coeffs, data$residuals)
+
+  get(adj_data_fn)(data$data, confounders, model_fn)
+}
+
+data_adj_v <- Vectorize(data_adj, SIMPLIFY = FALSE)
+
+stats <- function (data, adj_data_fn = NULL, model_fn = NA) {
+  if (is.null(data)) {
+    return(NULL)
+  }
+
+  confounders <- length(data$coeffs)
+
+  data$data %<>% set_Y(data$intercept, data$coeffs, data$residuals)
+
+  boot_res <- boot::boot(
+    data$data,
+    function (data, is) {
+      data_subset <- data[is, ]
+
+      if (!is.null(adj_data_fn)) {
+        adj_data <- get(adj_data_fn)(data_subset, confounders, model_fn)
+        supersampled <- supersample(adj_data)
+      } else {
+        adj_data <- supersampled <- data
+      }
+
+      data_X0_C1 <- supersampled %>% filter(X == 0) %>% `$`('C1')
+      data_X1_C1 <- supersampled %>% filter(X == 1) %>% `$`('C1')
+      data_X0_C2 <- supersampled %>% filter(X == 0) %>% `$`('C2')
+      data_X1_C2 <- supersampled %>% filter(X == 1) %>% `$`('C2')
+
+      c(
+        lm_weighted(Y_formula(confounders), adj_data)$coefficients,
+        smd(supersampled$X, supersampled$C1),
+        var(data_X1_C1) / var(data_X0_C1),
+        min(data_X1_C1) - min(data_X0_C1),
+        quantile(data_X1_C1, probs = 0.25) - quantile(data_X0_C1, probs = 0.25),
+        median(data_X1_C1) - median(data_X0_C1),
+        quantile(data_X1_C1, probs = 0.75) - quantile(data_X0_C1, probs = 0.75),
+        max(data_X1_C1) - max(data_X0_C1),
+        smd(supersampled$X, supersampled$C2),
+        var(data_X1_C2) / var(data_X0_C2),
+        min(data_X1_C2) - min(data_X0_C2),
+        quantile(data_X1_C2, probs = 0.25) - quantile(data_X0_C2, probs = 0.25),
+        median(data_X1_C2) - median(data_X0_C2),
+        quantile(data_X1_C2, probs = 0.75) - quantile(data_X0_C2, probs = 0.75),
+        max(data_X1_C2) - max(data_X0_C2),
+        prog_smd(supersampled),
+        min(adj_data$weights, na.rm = TRUE),
+        max(adj_data$weights, na.rm = TRUE)
+      )
+    },
+    R = 999,
+    parallel = 'multicore'
+  )
+
+  tribble(
+    ~term,              ~stat,      ~estimate,            ~std.error,
+    '(Intercept)',      'Estimate', mean(boot_res$t[,1]), sd(boot_res$t[,1]),
+    'X',                'Estimate', mean(boot_res$t[,2]), sd(boot_res$t[,2]),
+    'C1',               'Estimate', mean(boot_res$t[,3]), sd(boot_res$t[,3]),
+    'C2',               'Estimate', mean(boot_res$t[,4]), sd(boot_res$t[,4]),
+    'C1',               'SMD',      mean(boot_res$t[,5]), sd(boot_res$t[,5]),
+    'C1',               'VR',       mean(boot_res$t[,6]), sd(boot_res$t[,6]),
+    'C1',               'Q0D',      mean(boot_res$t[,7]), sd(boot_res$t[,7]),
+    'C1',               'Q1D',      mean(boot_res$t[,8]), sd(boot_res$t[,8]),
+    'C1',               'Q2D',      mean(boot_res$t[,9]), sd(boot_res$t[,9]),
+    'C1',               'Q3D',      mean(boot_res$t[,10]), sd(boot_res$t[,10]),
+    'C1',               'Q4D',      mean(boot_res$t[,11]), sd(boot_res$t[,11]),
+    'C2',               'SMD',      mean(boot_res$t[,12]), sd(boot_res$t[,12]),
+    'C2',               'VR',       mean(boot_res$t[,13]), sd(boot_res$t[,13]),
+    'C2',               'Q0D',      mean(boot_res$t[,14]), sd(boot_res$t[,14]),
+    'C2',               'Q1D',      mean(boot_res$t[,15]), sd(boot_res$t[,15]),
+    'C2',               'Q2D',      mean(boot_res$t[,16]), sd(boot_res$t[,16]),
+    'C2',               'Q3D',      mean(boot_res$t[,17]), sd(boot_res$t[,17]),
+    'C2',               'Q4D',      mean(boot_res$t[,18]), sd(boot_res$t[,18]),
+    'Prognostic score', 'SMD',      mean(boot_res$t[,19]), sd(boot_res$t[,19]),
+    'Weights',          'Minimum',  mean(boot_res$t[,20]), sd(boot_res$t[,20]),
+    'Weights',          'Maximum',  mean(boot_res$t[,20]), sd(boot_res$t[,20]),
+  )
+}
+
+stats_v <- Vectorize(stats, SIMPLIFY = FALSE)
+
+stats_table <- function (scenarios, data) {
+  tribble(
+    ~name,        ~stats,
+    'True',       tribble(
+                    ~term,          ~stat,      ~estimate,            ~std.error,
+                    '(Intercept)',  'Estimate', data$intercept,       NA,
+                    'X',            'Estimate', 1,                    NA,
+                    'C1',           'Estimate', data$coeffs[1],       NA,
+                    'C2',           'Estimate', data$coeffs[2],       NA,
+                  ),
+    'Unadjusted', stats(data)
+  ) %>%
+    rbind(
+      scenarios %>%
+        mutate(
+          data = list(list(data)),
+          stats = stats_v(data, data_fn, model_fn)
+        ) %>%
+        select(name, stats)
+    ) %>%
+    unnest(stats)
+}
+```
+
+```{r write-stats-table, echo = FALSE, eval = FALSE}
+stats <- stats_table(scenarios, data)
+
+write.table(stats, 'stats.csv')
+```
+
+```{r read-adv-stats, echo = FALSE}
+stats <- read.table(
+  'stats.csv',
+  header = TRUE,
+  row.names = 1
+)
+```
+
+Table \ref{tab:adv-results-table} and Figure \ref{fig:adv-coeffs-plot} show the estimate and bootstrap standard errors of the recovered causal effects of $X$ on $Y$ for each scenario for both unadjusted and adjusted models. **For all scenarios, the adjusted model results in a more biased estimate versus the unadjusted model.** Only `mahal_match_nn_caliper` provides an estimate which is close to the unadjusted estimate, such that the unadjusted estimate falls within the confidence interval of the adjusted estimate. For all other adjustment methods, we observe significant bias, with both the true effect value and the estimated unadjusted effect value sitting outside the confidence intervals. We also note that all estimates on the adjusted data are biased upwards, in the same direction as the unadjusted bias.
+
+```{r adv-results-table, echo = FALSE}
+results <- stats %>%
+  filter(term == 'X') %>%
+  select(!term)
+
+results_orig <- results %>%
+  filter(name == 'Unadjusted')
+
+results %<>% mutate(
+  bias = abs(estimate - 1),
+  stat = NULL
+)
+
+kable(
+  results,
+  digits = 3,
+  caption = 'Recovered causal estimates and bootstrap standard errors of X on Y for the unadjusted and adjusted models. We include the true causal effect for reference. Bias shows the absolute difference between the true effect and the estimate for each model.',
+  row.names = FALSE,
+  col.names = c('Name', 'Estimate', 'Standard error', 'Bias')
+)
+```
+
+```{r stats-plot, echo = FALSE}
+stats_plot <- function (stats) {
+  ggplot(
+    stats,
+    aes(
+      x = estimate,
+      y = name
+    )
+  ) +
+    geom_point() +
+    geom_errorbarh(
+      aes(
+        xmin = estimate - std.error,
+        xmax = estimate + std.error
+      )
+    )
+}
+```
+
+```{r adv-coeffs-plot, echo = FALSE, warning = FALSE, fig.cap = 'Recovered estimates and bootstrap standard errors X in a correctly specified outcome model. We include the true value for reference.'}
+coeffs <- stats %>%
+  filter(
+    term %in% c(
+      #'(Intercept)',
+      'X'#,
+      #'C1',
+      #'C2'
+    ) &
+    stat == 'Estimate'
+  )
+
+stats_plot(coeffs) +
+  facet_wrap(
+    vars(term)
+  ) +
+  labs(
+    x = 'Estimate',
+    y = 'Name'
+  )
+```
+
+Figure \ref{fig:adv-smds-plot} shows the estimated standardised mean differences for the confounders and for a prognostic score estimated from a correctly specified model $Y \sim C_1 + C_2$, along with their bootstrap standard errors. We also plot guidelines at -0.1 and 0.1 indicating a standard region for acceptable balance. We observe that although the estimate from the  unadjusted model lies well outside this region and would be considered unbalanced, the majority of the covariate estimates from the adjusted models lie within the balanced region for both confounders and for the estimated prognostic score, or very close to these thresholds.
+
+```{r adv-smds-table, echo = FALSE}
+smds <- stats %>%
+  filter(
+    stat == 'SMD'
+  ) %>%
+  select(!stat)
+
+# kable(smds, digits = 3)
+```
+
+```{r adv-smds-plot, echo = FALSE, fig.cap = 'Estimated standardised mean differences and bootstrap standard errors for confounders and a prognostic score estimated from a correctly specified model. Lines at -0.1 and 0.1 represent bounds of the region of acceptable balance.'}
+stats_plot(smds) +
+  facet_wrap(
+    vars(term)
+  ) +
+  labs(
+    x = 'Estimate',
+    y = 'Name'
+  ) +
+  geom_vline(aes(xintercept = -0.1, alpha = 0.5)) +
+  geom_vline(aes(xintercept = 0.1, alpha = 0.5)) +
+  guides(alpha = 'none')
+```
+
+Figure \ref{fig:adv-vrs-plot} shows the estimated variance ratios for the confounders along with bootstrap standard errors. We also plot guidelines at 0.8 and 1.25, indicating a narrow region of acceptable balance. We observe that all adjusted models have variance ratios for both confounders that lie comfortably within this window, while the unadjusted model shows a lack of balance for $C_2$. The bootstrap standards errors create wide confidence intervals in most instances.
+
+```{r adv-vrs-table, echo = FALSE}
+vrs <- stats %>%
+  filter(
+    stat == 'VR'
+  ) %>%
+  select(!stat)
+
+# kable(vrs, digits = 3)
+```
+
+```{r adv-vrs-plot, echo = FALSE, fig.cap = 'Estimated variance ratios and bootstrap standard errors for confounders. Lines at 0.8 and 1.25 represent bounds of the region of acceptable balance.'}
+stats_plot(vrs) +
+  facet_wrap(
+    vars(term)
+  ) +
+  labs(
+    x = 'Estimate',
+    y = 'Name'
+  ) +
+  geom_vline(aes(xintercept = 0.8, alpha = 0.5)) +
+  geom_vline(aes(xintercept = 1.25, alpha = 0.5)) +
+  guides(alpha = 'none')
+```
+
+Figure \ref{fig:adv-quartiles-plot} shows the estimated differences for the five summary statistics (minimum, 25% value, median, 75% value, maximum) along with bootstrap standard errors. We also plot guidelines at -0.05 and 0.05 indicating a region of acceptable balance. We observe that almost all adjusted models lie within the balanced region for all these statistics, whereas the unadjusted model falls within the balanced region for most, but not all, of these statistics.
+
+```{r adv-quartiles-table, echo = FALSE}
+quartiles <- stats %>%
+  filter(
+    stat %in% c('Q0D', 'Q1D', 'Q2D', 'Q3D', 'Q4D')
+  )
+
+# kable(quartiles, digits = 3)
+```
+
+```{r adv-quartiles-plot, echo = FALSE, fig.cap = 'Estimated differences and bootstrap standard errors for the five summary statistics (minimum, 25\\% value, median, 75\\% value, maximum) for the confounders. Lines at -0.05 and 0.05 represent bounds of the region of acceptable balance.'}
+stats_plot(quartiles) +
+  facet_wrap(
+    vars(term, stat),
+    ncol = 5
+  ) +
+  labs(
+    x = 'Estimate',
+    y = 'Name'
+  ) +
+  geom_vline(aes(xintercept = -0.05, alpha = 0.5)) +
+  geom_vline(aes(xintercept = 0.05, alpha = 0.5)) +
+  guides(alpha = 'none')
+```
+
+Figure \ref{fig:ps-plots} show the distributions of propensity scores for the unadjusted and adjusted models. This is a kernel density plot, which is created by sliding a kernel function over the empirical distribution of propensity scores and integrating the result, to create a smoothed plot of the probability density of this distribution. We have calculated the densities using a rectangular kernel with standard deviation $`r caliper_width` / \sqrt{12}$, corresponding to a uniform distribution with width `r caliper_width`, which is identical to the caliper width chosen for nearest neighbour within-caliper matching. Thus, these plots show approximate probability densities for finding exposed and unexposed individuals within any given range of the propensity score. We observe that the propensity score distribution is much more well-balanced for the adjusted models, and the range of the balanced distributions is also wide, as would be expected for a successful application of propensity score adjustment methods.
+
+We note that `mahal_match_nn_caliper`, the only adjustment method to provide an effect estimate which was not substantially more biased than the unadjusted data, selects the narrowest range of propensity scores. This may indicate that it is the observations with the more extreme values of propensity score which are responsible for the adversarial behaviour of our dataset, and that perhaps by eliminating these observations that the `mahal_match_nn_caliper` model has managed to avoid introducing additional bias.
+
+```{r adj-datas, echo = FALSE, message = FALSE}
+pre_adj_data <- data$data %>%
+                  set_Y(data$intercept, data$coeffs, data$residuals)
+
+adj_datas <- scenarios %>%
+  rowwise() %>%
+  mutate(
+    model_fn = if_else(is.na(model_fn), 'glm', model_fn),
+    adj_data = get(data_fn)(pre_adj_data, confounders, model_fn) %>%
+                list() %>%
+                list()
+  ) %>%
+  rbind(
+    tibble(
+      confounders = 2,
+      data_fn = NA,
+      model_fn = 'glm',
+      name = 'Unadjusted',
+      adj_data = list(list(pre_adj_data %>% mutate(weights = 1)))
+    )
+  ) %>%
+  rowwise() %>%
+  mutate(
+    ps = list(prop_score(adj_data[[1]], X_prop_formula(confounders), model_fn)),
+    adj_data = list(list(adj_data[[1]] %>% mutate(PS = ps))),
+    ps = NULL
+  ) %>%
+  unnest(adj_data) %>%
+  unnest(adj_data)
+```
+
+```{r ps-plots, echo = FALSE, message = FALSE, fig.cap = str_c('Density plots of the propensity scores of the exposed and unexposed groups in the unadjusted and adjusted models. Density is estimated with a rectangular kernel with standard deviation ', caliper_width, ' / sqrt(12) corresponding to a uniform distribution with width ', caliper_width, ', which is identical to the caliper width chosen for nearest neighbour within-caliper matching.')}
+ggplot(
+  adj_datas,
+  aes(x = PS,  weight = weights)
+) +
+  geom_density(
+    aes(fill = factor(X), alpha = 0.5),
+    kernel = 'rectangular',
+    bw = caliper_width / sqrt(12)
+  ) +
+  scale_fill_grey() +
+  facet_wrap(
+    vars(name)
+  ) +
+  guides(alpha = 'none') +
+  labs(
+    fill = 'X',
+    x = 'Propensity score',
+    y = 'Density'
+  )
+```
+
+```{r scatter-shapes, echo = FALSE}
+X_shapes <- scale_shape_manual(values = c(1, 16))
+
+plot_scatters <- function (x, y) {
+  ggplot(
+    adj_datas,
+    aes(x = !!enquo(x), y = !!enquo(y), alpha = weights)
+  ) +
+    geom_point(
+      aes(shape = factor(X))
+    ) +
+    X_shapes +
+    facet_wrap(
+      vars(name),
+      ncol = 3
+    ) +
+    labs(
+      shape = 'X',
+      alpha = 'Weight'
+    )
+}
+```
+
+Figures \ref{fig:plot-scatter-c1-c2}, \ref{fig:plot-scatter-c1-y}, and \ref{fig:plot-scatter-c2-y} show scatter plots of the confounders and the outcome. For the unadjusted model, we observe a healthy mixing of the exposure regimes across both confounders. The plots suggest that the effect of the confounders on the outcome may be in a different direction for each exposure regime. In particular, we observe lower values outcomes for the unexposed group at lower values of $C_2$, but this correlation does not seem to be present for the exposed group. However, any pair of variables is misleading, because for each individual, we cannot see the value of both confounders and the outcome variable from a single 2D plot. Indeed, we know that these data are generated from a known linear relationship. These plots also reveal how the different adjustment methods up-weight different individuals in the dataset, with a preference for individuals at the upper values of the $C_1$ in both groups.
+
+```{r plot-scatter-c1-c2, echo = FALSE, fig.cap = 'Unjittered scatter plots of C₁ versus C₂ for the unadjusted and adjusted models. Empty circles are unexposed and filled circles are exposed. Alpha value indicates weight, which is fixed at 1 for all observations in the unadjusted model.'}
+plot_scatters(C1, C2)
+```
+
+```{r plot-scatter-c1-y, echo = FALSE, fig.cap = 'Unjittered scatter plots of C₁ versus Y for the unadjusted and adjusted models. Empty circles are unexposed and filled circles are exposed. Alpha value indicates weight, which is fixed at 1 for all observations in the unadjusted model.'}
+plot_scatters(C1, Y)
+```
+
+```{r plot-scatter-c2-y, echo = FALSE, fig.cap = 'Unjittered scatter plots of C₂ versus Y for the unadjusted and adjusted models. Empty circles are unexposed and filled circles are exposed. Alpha value indicates weight, which is fixed at 1 for all observations in the unadjusted model.'}
+plot_scatters(C2, Y)
+```
+
+# Discussion
+
+We have demonstrated that a dataset can exist which will create a highly biased estimate of a causal effect under a wide variety of different propensity score adjustment approaches, yet scatter plots do not reveal anything particularly suspicious about the data, and balance diagnostics indicate that the different exposure regimes are well-matched. Our results are concerning for several reasons.
+
+First, they demonstrate that different adjustment methods can produce adjustment models with significantly different balance diagnostics, and differently weighted regions of common support. Given the large number of adjustment methods available to practitioners, this is problematic because there are no clear reasons why one method should be chosen over another, without careful consideration of the specifics of the dataset to be analysed.
+
+In theory this problem could be mitigated by triangulating results across multiple methods: researchers could deploy coarsened exact matching, optimal full matching, and inverse probability weighting, and infer that their results are robust if the balance diagnostics and common support regions were consistent across these different methods. However, we have also shown that even when these statistics triangulate across some methods, this is not a guarantee that the results are robust.
+
+The most concerning result we demonstrate is that, even when many different adjustment methods are used, there exist some datasets which are adversarial and create highly biased estimates of causal effects while displaying excellent balance diagnostics and large, balanced regions of common support. These biased results arise even when the propensity score model and the outcome model are correctly specified and there is an absence of unobserved confounding. Thus, the current suite of balance checks that are used in practice are not sufficient to guarantee the validity of any propensity score adjustment.
+
+Our results do raise additional questions, along with some possibilities for better balance diagnostics to be investigated in future research.
+
+First, we observed that the bootstrap standard errors of the balance checks investigated were quite large in most instances, creating confidence intervals for these statistics that either spanned a large range of the balanced regions or spilled outside of these regions. We have not conducted a comprehensive literature review, but we have not come across any papers making use of propensity score methods which report bootstrap standard errors or confidence intervals for balance diagnostics. Therefore we cannot report if the bootstrap intervals for the balance diagnostics in our study are reasonable, or if they are an indication of a fragile or adversarial dataset.
+
+Although bootstrap standard errors for causal estimates are commonly reported per guidance from @austinUseBootstrappingWhen2014, we remind readers that balance diagnostics are also statistical measures with their own underlying distributions. Therefore, we encourage researchers to calculate their balance diagnostics within a bootstrap process and to report bootstrap standard errors for these diagnostics as part of their robustness checks. It may be that narrow bootstrap confidence intervals for existing balance diagnostics, such as standardised mean differences, would be sufficient to indicate the robustness of the achieved balance. The optimisation methodology we have used in this paper could be adapted to further constrain these intervals, and further research is required to determine if such additional constraints would reduce or eliminate bias in the resulting model-adjusted datasets.
+
+Second, given the existing use of the variance ratio as a balance diagnostic, we are curious if the ratios of higher order moments, such skewness and kurtosis, can also be used to assess balance. Further, we speculate that perhaps including additional constraints on skewness and kurtosis would prevent our methodology from being able to optimise an adversarial dataset. Unfortunately we were not able to explore these additional constraints in this paper due to limited researcher time and additional computational complexity, but the code used for our study is open and can be easily extended to explore this in future work.
+
+Third, our results show that bias was lowest when performing nearest neighbour within-caliper matching on the Mahalanobis distance. This indicates that, in datasets where the Mahalanobis distance can be computed, this metric may be useful as an alternative to the propensity score, or as an additional diagnostic, per @stuartPrognosticScoreBased2013's use of the prognostic score.
+
+Finally, this paper shows the utility of optimisation methods, and genetic algorithms in particular, for discovering dysfunctional or adversarial inputs to typical statistical methods. Just as @anscombeGraphsStatisticalAnalysis1973 showed that summary statistics can be misleading and should be supplemented with graphical analysis, we hope that our work inspires statistical methodologists to make use of computer optimisation methods as part of their simulation studies, alongside mathematical proofs, in order to test the robustness of their inventions.
+
+One limitation of our study is the small sample sizes for the different exposure regimes in our dataset. This is due to the way we have formulated the optimisation problem for our genetic algorithm, such that the values of all covariates for all observations are specified as inputs to our fitness function. As we have carried out our optimisations on commercial hardware, there is a limit to dimensionality of the solution space which can be searched within a given amount of time and memory. Additional work would be needed to implement a study like this in a high performance computing environment, which would allow for optimising much larger datasets. This would in turn facilitate exploring datasets where the exposed and unexposed groups are of different sizes. Alternatively, the dimensionality of the solution space could be reduced by using intermediate sampling functions, although it is not immediately clear what functions would be suitable.
+
+Another limitation of our study is that we have only used generalised linear models (GLM) and generalised boosted models (GBM) for fitting propensity and outcome regression models, and we have not explored different sets of parameters for how these models can be solved. Therefore it is possible that our results are sensitive to how these models are solved. We have been unable to explore this issue further in this paper due to limited researcher time and additional computational complexity, and this should be a target for further research.
+
+Finally, due to limited researcher time, we have not been able to evaluate the use of doubly robust estimators [@funkDoublyRobustEstimation2011]. However as our dataset and code is open source, this would be straightforward next target for further research.
+
+# Conclusion
+
+Drawing inspiration from the adversarial example literature of machine learning, we have used a genetic algorithm to demonstrate the existence of datasets which cause common propensity score adjustment methods to produce causal effect estimates of greater bias than that observed for a correctly specified and unadjusted model. Importantly, these derived datasets arise in trivial, low-dimensional cases, without unobserved confounding, and are undetectable with current balance diagnostics. Given the prevalence of propensity score methods in the literature, this raises serious questions about the robustness of these methods, and makes a strong case that further research is needed in this area. Our methodology is also applicable to other statistical methods, for which adversarial dataset may also exist. We recommend that further research is conducted to discover new or extended balance diagnostics which can aid users of propensity score methods in detecting, and possibly correcting, adversarial datasets which are currently undetectable. In the short term, we advise users of propensity score methods to bootstrap their balance diagnostics and to report standardised errors for these statistics, just as they would for their effect estimates.
+
+# References
