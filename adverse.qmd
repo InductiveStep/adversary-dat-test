@@ -1,7 +1,7 @@
 ---
 title: "Exploring Preston and Gilthorpe's adversarial example"
 author: "@Andi@tech.lgbt"
-date: 2022-08-24
+date: 2023-08-26
 format:
   html:
     embed-resources: true
@@ -18,6 +18,7 @@ library(GGally)
 library(cobalt)
 library(mgcv)
 library(quantreg)
+library(bestNormalize)
 ```
 
 Poking around the solution for *Using optimisation methods to generate adversarial datasets for propensity score methods with large post-adjustment bias*, available [yonder](https://osf.io/d279k/).
@@ -81,7 +82,7 @@ set_Y <- function(data, intercept, coeffs, residuals) {
       ncol = length(coeffs),
       byrow = TRUE
     )) |>
-    transmute(dot = rowSums(across())) |>
+    transmute(dot = rowSums(across(.cols = everything()))) |>
     as.list() %>%
     `$`("dot")
 
@@ -165,15 +166,11 @@ Matching improved balance.
 Density plots:
 
 ```{r}
-bal.plot(X ~ C1, data = dat, 
-         weights = list(CEM = match_cem),
-         var.name = "C1", which = "both")
+bal.plot(match_cem, "C1", which = "both")
 ```
 
 ```{r}
-bal.plot(X ~ C2, data = dat, 
-         weights = list(CEM = match_cem),
-         var.name = "C2", which = "both")
+bal.plot(match_cem, "C2", which = "both")
 ```
 
 Also looks improved.
@@ -231,7 +228,7 @@ set.seed(25082023)
 Boot(simp_ols, R = 10000) |> confint()
 ```
 
-Bootstrap CI includes 1 again... hmmmm!
+Bootstrap CI includes the true answer 1 again... hmmmm!
 
 ## Quantile regression
 
@@ -243,3 +240,284 @@ summary(rq1)
 ```
 
 That's also better. Is this a potential clue I wonder... Some genre of skew or heteroskedasticity that's dragging the estimate above 1...?
+
+## Does fixing any skew help?
+
+```{r}
+set.seed(25082024)
+C1_norm <- bestNormalize(dat$C1)
+C2_norm <- bestNormalize(dat$C2)
+```
+
+```{r}
+C1_norm
+```
+
+```{r}
+C2_norm
+```
+
+```{r}
+dat2 <- dat |>
+  mutate(C1_t = C1_norm$x.t,
+         C2_t = C2_norm$x.t)
+```
+
+```{r}
+dat2
+```
+
+```{r}
+match_cem2 <- matchit(X  ~ C1_t + C2_t,
+                     method = "cem",
+                     data = dat2,
+                     estimand = "ATT")
+match_cem_dat2 <- match.data(match_cem2)
+```
+
+```{r}
+match_cem2
+```
+
+First look at the ASMD:
+
+```{r}
+love.plot(match_cem2, 
+          drop.distance = TRUE, 
+          var.order = "unadjusted",
+          abs = TRUE,
+          thresholds = c(m = .1))
+```
+
+Matching improved balance.
+
+Density plots:
+
+```{r}
+bal.plot(match_cem2, "C1_t", which = "both")
+```
+
+```{r}
+bal.plot(match_cem2, "C2_t", which = "both")
+```
+
+```{r}
+outmod2 <- lm(Y ~ X * (C1_t + C2_t), data = match_cem_dat2, weights = weights)
+
+avg_comparisons(outmod2,
+                variables = "X",
+                vcov = ~subclass,
+                newdata = subset(match_cem_dat2, X == 1),
+                wts = "weights")
+```
+
+```{r}
+simp_ols2 <- lm(Y ~ X + C1_t + C2_t, data = dat2)
+confint(simp_ols2)
+```
+
+Nope.
+
+
+## How about influential data points?
+
+We need a model. Could start with the simple OLS model, no interactions. We're primarily interested in anything that significantly shifts the estimate for X.
+
+```{r}
+dat$X_DFBETAS <- dfbetas(simp_ols)[,"X"]
+```
+
+We could use Bollen and Jackman's (1985) threshold:
+
+```{r}
+thresh <- 2/sqrt(nrow(dat))
+thresh
+```
+
+Which points to:
+
+```{r}
+dat |>
+  filter(abs(X_DFBETAS) > thresh)
+```
+
+
+
+```{r}
+dat_noinf <- dat |>
+  filter(abs(X_DFBETAS) <= thresh)
+```
+
+Let's try again with CEM:
+
+```{r}
+match_cem_noinf <- matchit(X  ~ C1 + C2,
+                     method = "cem",
+                     data = dat_noinf,
+                     estimand = "ATT")
+match_cem_dat_noinf <- match.data(match_cem_noinf)
+```
+
+```{r}
+match_cem_noinf
+```
+
+First look at the ASMD:
+
+```{r}
+love.plot(match_cem_noinf, 
+          drop.distance = TRUE, 
+          var.order = "unadjusted",
+          abs = TRUE,
+          thresholds = c(m = .1))
+```
+
+Matching improved balance.
+
+Density plots:
+
+```{r}
+bal.plot(match_cem_noinf, "C1", which = "both")
+```
+
+```{r}
+bal.plot(match_cem_noinf, "C2", which = "both")
+```
+
+Also still looks improved.
+
+Outcome model:
+
+```{r}
+outmod_noinf <- lm(Y ~ X, data = match_cem_dat_noinf, weights = weights)
+
+avg_comparisons(outmod_noinf,
+                variables = "X",
+                vcov = ~subclass,
+                newdata = subset(match_cem_dat_noinf, X == 1),
+                wts = "weights")
+```
+
+OMG look at that estimate -- exactly 1! Excitement tempered somewhat by the fact that I've analysed this poor n=200 simulated dataset to within an inch of its existence. Really need to replicate the approach on (ideally) a large number of other similar datasets.
+
+Also this feels naughty, since I've used OLS, pruned out observations that were influential, relative to the model I used, and then threw that at CEM. It's the reverse of what we usually want to do, i.e., use CEM as a non-parametric preprocessing step before applying a parametric model to estimate outcomes.
+
+So now I'm wondering if DFBETAS is already defined for matching. It wouldn't be hard to do it but it'll be inefficient for large datasets:
+
+1. Match.
+2. Estimate outcomes model.
+3. Leave each observation out in turn, reapply CEM, refit the outcomes model, and calculate DFBETAS, which is simply the shift in the coefficient for X divided by its SE.
+4. Since the sample size for each run of step 3 is likely to vary, we need to choose a constant for the threshold indicating an influential observation. Maybe just the total sample going in.
+
+Alternatively, and easier, we could just match once and calculate DFBETAS for the outcome model. Let's try...
+
+First revisit the original match:
+
+```{r}
+match_cem
+```
+
+This was the outcomes model, without application of weights or robust SE, but it'll do...:
+
+```{r}
+summary(outmod)
+```
+
+Add in the DFBETAS estimates:
+
+```{r}
+match_cem_dat$X_DFBETAS <- dfbetas(outmod)[,"X"]
+```
+
+```{r}
+new_thresh <- 2/sqrt(nrow(match_cem_dat))
+new_thresh
+```
+
+```{r}
+match_cem_dat_noinf <- match_cem_dat |>
+  filter(abs(X_DFBETAS) <= new_thresh) |>
+  select(-c(weights, subclass))
+match_cem_dat_noinf
+```
+
+
+Ten observations have been dropped off:
+
+```{r}
+nrow(match_cem_dat_noinf)
+```
+
+Now, go again (really should have wrapped this all in a function!):
+
+
+```{r}
+match_cem3 <- matchit(X  ~ C1 + C2,
+                     method = "cem",
+                     data = match_cem_dat_noinf,
+                     estimand = "ATT")
+match_cem_dat3 <- match.data(match_cem3)
+```
+
+```{r}
+match_cem3
+```
+
+Look at the ASMD:
+
+```{r}
+love.plot(match_cem3, 
+          drop.distance = TRUE, 
+          var.order = "unadjusted",
+          abs = TRUE,
+          thresholds = c(m = .1))
+```
+
+Matching (still) improved balance.
+
+Density plots:
+
+```{r}
+bal.plot(match_cem3, "C1", which = "both")
+```
+
+```{r}
+bal.plot(match_cem3, "C2", which = "both")
+```
+
+Okay C2 looks a bit wilder?
+
+
+```{r}
+outmod3 <- lm(Y ~ X, data = match_cem_dat3, weights = weights)
+
+avg_comparisons(outmod3,
+                variables = "X",
+                vcov = ~subclass,
+                newdata = subset(match_cem_dat3, X == 1),
+                wts = "weights")
+```
+
+
+Now the estimates is lower than 1 and the CI straddles 1.
+
+Finally, try a doubly robust estimate:
+
+```{r}
+outmod3_dr <- lm(Y ~ X * (C1 + C2),
+                 data = match_cem_dat3,
+                 weights = weights)
+
+avg_comparisons(outmod3_dr,
+                variables = "X",
+                vcov = ~subclass,
+                newdata = subset(match_cem_dat3, X == 1),
+                wts = "weights")
+```
+
+Even smaller estimate, but CI still includes 1.
+
+
+
+
+
