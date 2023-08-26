@@ -13,6 +13,7 @@ library(tidyverse)
 library(magrittr)
 library(car)
 library(MatchIt)
+library(WeightIt)
 library(marginaleffects)
 library(GGally)
 library(cobalt)
@@ -302,7 +303,8 @@ bal.plot(match_cem2, "C2_t", which = "both")
 ```
 
 ```{r}
-outmod2 <- lm(Y ~ X * (C1_t + C2_t), data = match_cem_dat2, weights = weights)
+outmod2 <- lm(Y ~ X * (C1_t + C2_t), data = match_cem_dat2,
+              weights = weights)
 
 avg_comparisons(outmod2,
                 variables = "X",
@@ -417,7 +419,7 @@ First revisit the original match:
 match_cem
 ```
 
-This was the outcomes model, without application of weights or robust SE, but it'll do...:
+This was the outcomes model, without robust SE, but it'll do...:
 
 ```{r}
 summary(outmod)
@@ -517,6 +519,52 @@ avg_comparisons(outmod3_dr,
 
 Even smaller estimate, but CI still includes 1.
 
+
+## Overlap weights
+
+I haven't touched propensity score methods yet.
+
+If there's something funny going on with extreme values then we might expect overlap weights to be unbothered by them. However, they give us a different estimand: average treatment effect at overlap (ATO).
+
+Let's see what happens; back to the original data:
+
+```{r}
+dat_weight <- weightit(X ~ C1 + C2,
+              method = "glm",
+              estimand = "ATO",
+              data = dat)
+dat_weight
+```
+
+```{r}
+dat$OW <- dat_weight$weights
+```
+
+First, without any covariates in the outcome model:
+
+```{r}
+outmod_ato <- lm(Y ~ X, data = dat, weights = OW)
+
+avg_comparisons(outmod_ato,
+                variables = "X",
+                vcov = "HC3",
+                wts = "OW")
+```
+
+The CI just about includes 1.
+
+If we make it doubly-robust, though, then it breaks:
+
+```{r}
+outmod_ato_dr <- lm(Y ~ X * (C1 + C2), data = dat, weights = OW)
+
+avg_comparisons(outmod_ato_dr,
+                variables = "X",
+                vcov = "HC3",
+                wts = "OW")
+```
+
+CI just excludes 1.
 
 
 
